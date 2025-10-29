@@ -4,6 +4,7 @@ CC = g++
 CFLAGS = -O3 -std=c++11 -Wall -Wextra
 DEBUG_CFLAGS = -g -O0 -std=c++11 -Wall -Wextra -DDEBUG
 LDFLAGS = -lm
+PYTHON ?= python3
 
 # Directories
 TEST_DIR = test
@@ -23,7 +24,14 @@ TEST_OPS = test_ops
 TEST_COMPONENTS = test_components
 TEST_INTEGRATION = test_integration
 
-.PHONY: all clean build test-data test-ops test-components test-integration test debug help
+# Parity defaults (override on the command line if desired)
+CHECKPOINT ?= ../output/ckpt/LJSpeech/900000.pth.tar
+PREPROCESS_CFG ?= ../config/LJSpeech/preprocess.yaml
+MODEL_CFG ?= ../config/LJSpeech/model.yaml
+WEIGHTS_DIR ?= weights
+PHONEMES ?= 23,15,8,32,45,12
+
+.PHONY: all clean build test-data test-ops test-components test-integration test debug parity-check help
 
 # Default target
 all: build
@@ -74,8 +82,19 @@ test: test-ops test-components test-integration
 # Convert PyTorch weights to binary format
 convert-weights:
 	@echo "Converting PyTorch weights to binary format..."
-	python3 $(TOOLS_DIR)/convert_weights.py
+	$(PYTHON) $(TOOLS_DIR)/convert_weights.py
 	@echo "✓ Weights converted"
+
+# Compare C++ runtime against PyTorch reference
+parity-check: build
+	@echo "Running PyTorch vs C++ parity check..."
+	$(PYTHON) $(TOOLS_DIR)/compare_runtime.py \
+		--checkpoint $(CHECKPOINT) \
+		--preprocess_config $(PREPROCESS_CFG) \
+		--model_config $(MODEL_CFG) \
+		--weights_dir $(WEIGHTS_DIR) \
+		--runtime ./$(EXEC) \
+		--phonemes "$(PHONEMES)"
 
 # Clean build artifacts
 clean:
@@ -101,6 +120,7 @@ help:
 	@echo "  make test-integration   - Run end-to-end integration tests"
 	@echo "  make test               - Run all tests"
 	@echo "  make convert-weights    - Convert PyTorch weights to binary"
+	@echo "  make parity-check       - Compare the C++ runtime against PyTorch"
 	@echo "  make clean              - Clean build artifacts"
 	@echo "  make clean-all          - Clean everything including test data"
 	@echo "  make help               - Show this help message"

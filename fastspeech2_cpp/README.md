@@ -63,12 +63,39 @@ tools to convert checkpoints and prepare inputs.
    The script runs both implementations and reports the maximum absolute/relative
    difference between their mel-spectrograms.
 
-6. **Build the C++ binary**
+6. **(Optional) Capture full intermediate dumps for parity debugging**
+   1. Dump PyTorch tensors:
+      ```bash
+      python3 tools/dump_pytorch_intermediates.py \
+        --checkpoint ../output/ckpt/LJSpeech/900000.pth.tar \
+        --preprocess_config ../config/LJSpeech/preprocess.yaml \
+        --model_config ../config/LJSpeech/model.yaml \
+        --output_dir test_data/py_ref \
+        --phonemes "23,15,8,32,45,12"
+      ```
+   2. Run the C++ runtime with dumping enabled:
+      ```bash
+      ./fastspeech2 \
+        --config weights/config.bin \
+        --weights weights \
+        --phonemes "23,15,8,32,45,12" \
+        --dump_dir test_data/cpp_dump
+      ```
+   3. Compare every tensor:
+      ```bash
+      python3 tools/compare_dumps.py \
+        --pytorch_dir test_data/py_ref \
+        --cpp_dir test_data/cpp_dump
+      ```
+   The script reports max absolute/relative errors for each intermediate and exits
+   non-zero if tolerances are exceeded.
+
+7. **Build the C++ binary**
    ```bash
    make build        # Produces ./fastspeech2
    ```
 
-7. **Run inference**
+8. **Run inference**
    - With phoneme IDs in a file (comma or whitespace separated):
      ```bash
      ./fastspeech2 \
@@ -124,6 +151,9 @@ Exactly one of `--input` or `--phonemes` must be supplied.
 - `make test-data` – Regenerates reference tensors from the PyTorch pipeline.
 - `make test-ops` – Builds and runs operator unit tests (requires generated data).
 - `make test-components` / `make test-integration` – Component and E2E comparisons.
+- `make parity-check` – Runs `tools/compare_runtime.py` against the C++ binary using the
+  sample LJSpeech checkpoint (override `CHECKPOINT`, `PREPROCESS_CFG`, `MODEL_CFG`,
+  `WEIGHTS_DIR`, or `PHONEMES` to customise).
 - `make debug` – Builds a symbol-enabled binary for stepping through layers.
 
 The current repository focuses on inference correctness. Operator/component test data
