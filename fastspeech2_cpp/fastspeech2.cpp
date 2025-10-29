@@ -1,0 +1,501 @@
+#include "fastspeech2.h"
+#include "op.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+
+// ============================================================================
+// Initialization and Cleanup Functions
+// ============================================================================
+
+void init_config(Config* c) {
+    // Initialize with default LJSpeech config values
+    c->dim = 256;
+    c->n_enc_layers = 4;
+    c->n_dec_layers = 6;
+    c->n_heads = 2;
+    c->head_dim = 128;  // dim / n_heads
+    c->ffn_hidden = 1024;
+
+    c->vocab_size = 300;
+    c->n_mels = 80;
+    c->max_seq_len = 1000;
+
+    c->var_pred_filter_size = 256;
+    c->var_pred_kernel_size = 3;
+    c->var_pred_dropout = 0.5f;
+    c->n_bins = 256;
+
+    c->postnet_embedding_dim = 512;
+    c->postnet_kernel_size = 5;
+    c->postnet_n_convolutions = 5;
+
+    c->pitch_min = -2.917f;
+    c->pitch_max = 11.391f;
+    c->energy_min = -1.431f;
+    c->energy_max = 8.184f;
+}
+
+RunState* create_run_state(Config* c) {
+    RunState* s = new RunState;
+
+    int max_frames = c->max_seq_len * 20;  // Assume max duration ~20 frames per phoneme
+
+    // Encoder buffers
+    s->encoder_emb = new float[c->max_seq_len * c->dim]();
+    s->encoder_out = new float[c->max_seq_len * c->dim]();
+
+    // Variance Adaptor buffers
+    s->duration_pred = new float[c->max_seq_len]();
+    s->pitch_pred = new float[c->max_seq_len]();
+    s->energy_pred = new float[c->max_seq_len]();
+    s->durations = new int[c->max_seq_len]();
+    s->variance_out = new float[max_frames * c->dim]();
+    s->mel_len = 0;
+
+    // Decoder buffers
+    s->decoder_out = new float[max_frames * c->dim]();
+
+    // Output buffers
+    s->mel_out = new float[max_frames * c->n_mels]();
+    s->postnet_mel_out = new float[max_frames * c->n_mels]();
+
+    // Temporary attention/FFN buffers
+    s->attn_q = new float[max_frames * c->dim]();
+    s->attn_k = new float[max_frames * c->dim]();
+    s->attn_v = new float[max_frames * c->dim]();
+    s->attn_scores = new float[c->n_heads * max_frames * max_frames]();
+    s->attn_out = new float[max_frames * c->dim]();
+    s->ffn_hidden = new float[max_frames * c->ffn_hidden]();
+    s->ffn_out = new float[max_frames * c->dim]();
+
+    // Conv1D temporary buffers
+    s->conv_buf1 = new float[max_frames * c->var_pred_filter_size]();
+    s->conv_buf2 = new float[max_frames * c->var_pred_filter_size]();
+
+    return s;
+}
+
+void free_run_state(RunState* s) {
+    delete[] s->encoder_emb;
+    delete[] s->encoder_out;
+    delete[] s->duration_pred;
+    delete[] s->pitch_pred;
+    delete[] s->energy_pred;
+    delete[] s->durations;
+    delete[] s->variance_out;
+    delete[] s->decoder_out;
+    delete[] s->mel_out;
+    delete[] s->postnet_mel_out;
+    delete[] s->attn_q;
+    delete[] s->attn_k;
+    delete[] s->attn_v;
+    delete[] s->attn_scores;
+    delete[] s->attn_out;
+    delete[] s->ffn_hidden;
+    delete[] s->ffn_out;
+    delete[] s->conv_buf1;
+    delete[] s->conv_buf2;
+    delete s;
+}
+
+Weights* create_weights(Config* c) {
+    Weights* w = new Weights;
+
+    // Encoder
+    w->encoder_embedding = nullptr;
+    w->encoder_pe = new float[c->max_seq_len * c->dim]();
+    w->encoder_layers = new FFTLayer[c->n_enc_layers];
+    memset(w->encoder_layers, 0, c->n_enc_layers * sizeof(FFTLayer));
+
+    // Variance Adaptor - initialize structures
+    memset(&w->duration_predictor, 0, sizeof(VariancePredictor));
+    memset(&w->pitch_predictor, 0, sizeof(VariancePredictor));
+    memset(&w->energy_predictor, 0, sizeof(VariancePredictor));
+    w->pitch_embedding = nullptr;
+    w->energy_embedding = nullptr;
+
+    // Decoder
+    w->decoder_pe = new float[c->max_seq_len * c->dim]();
+    w->decoder_layers = new FFTLayer[c->n_dec_layers];
+    memset(w->decoder_layers, 0, c->n_dec_layers * sizeof(FFTLayer));
+
+    // Mel linear
+    w->mel_linear_weight = nullptr;
+    w->mel_linear_bias = nullptr;
+
+    // PostNet
+    w->postnet_layers = new PostNetLayer[c->postnet_n_convolutions];
+    memset(w->postnet_layers, 0, c->postnet_n_convolutions * sizeof(PostNetLayer));
+
+    // Generate positional encodings
+    sinusoidal_position_encoding(w->encoder_pe, c->max_seq_len, c->dim);
+    sinusoidal_position_encoding(w->decoder_pe, c->max_seq_len, c->dim);
+
+    return w;
+}
+
+void free_weights(Weights* w, Config* c) {
+    // Free encoder
+    delete[] w->encoder_embedding;
+    delete[] w->encoder_pe;
+    // Note: FFTLayer weights would need individual freeing if allocated
+    delete[] w->encoder_layers;
+
+    // Free variance predictor weights (would need detailed freeing if allocated)
+    delete[] w->pitch_embedding;
+    delete[] w->energy_embedding;
+
+    // Free decoder
+    delete[] w->decoder_pe;
+    delete[] w->decoder_layers;
+
+    // Free mel linear
+    delete[] w->mel_linear_weight;
+    delete[] w->mel_linear_bias;
+
+    // Free PostNet
+    delete[] w->postnet_layers;
+
+    delete w;
+}
+
+// ============================================================================
+// Weight Loading Functions
+// ============================================================================
+
+void load_config(const char* config_path, Config* c) {
+    FILE* f = fopen(config_path, "rb");
+    if (!f) {
+        fprintf(stderr, "Error: Could not open config file %s\n", config_path);
+        exit(1);
+    }
+
+    // Read config (matches the format from convert_weights.py)
+    int int_configs[11];
+    float float_configs[5];
+    int int_configs2[4];
+
+    fread(int_configs, sizeof(int), 11, f);
+    fread(float_configs, sizeof(float), 5, f);
+    fread(int_configs2, sizeof(int), 4, f);
+
+    c->dim = int_configs[0];
+    c->n_enc_layers = int_configs[1];
+    c->n_dec_layers = int_configs[2];
+    c->n_heads = int_configs[3];
+    c->head_dim = int_configs[4];
+    c->ffn_hidden = int_configs[5];
+    c->vocab_size = int_configs[6];
+    c->n_mels = int_configs[7];
+    c->max_seq_len = int_configs[8];
+    c->var_pred_filter_size = int_configs[9];
+    c->var_pred_kernel_size = int_configs[10];
+
+    c->var_pred_dropout = float_configs[0];
+    c->pitch_min = float_configs[1];
+    c->pitch_max = float_configs[2];
+    c->energy_min = float_configs[3];
+    c->energy_max = float_configs[4];
+
+    c->n_bins = int_configs2[0];
+    c->postnet_embedding_dim = int_configs2[1];
+    c->postnet_kernel_size = int_configs2[2];
+    c->postnet_n_convolutions = int_configs2[3];
+
+    fclose(f);
+
+    printf("✓ Loaded config: dim=%d, enc_layers=%d, dec_layers=%d\n",
+           c->dim, c->n_enc_layers, c->n_dec_layers);
+}
+
+void load_weights(const char* weights_path, Weights* w, Config* c) {
+    // This is a placeholder - actual implementation would load from binary files
+    // organized in the directory structure created by convert_weights.py
+    printf("Loading weights from %s...\n", weights_path);
+
+    // TODO: Implement actual weight loading from binary files
+    // This would involve reading files like:
+    // - encoder/embedding.bin
+    // - encoder/layer_0/attn_q_weight.bin
+    // - variance_adaptor/duration_predictor/conv1_weight.bin
+    // - etc.
+
+    fprintf(stderr, "Warning: Weight loading not yet implemented\n");
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+int quantize_value(float value, float min_val, float max_val, int n_bins) {
+    // Quantize a continuous value to bin index
+    float normalized = (value - min_val) / (max_val - min_val);
+    normalized = fmaxf(0.0f, fminf(1.0f, normalized));  // Clip to [0, 1]
+    int bin = (int)(normalized * (n_bins - 1));
+    return bin;
+}
+
+// ============================================================================
+// Encoder Implementation
+// ============================================================================
+
+void encoder_layer_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len) {
+    // Multi-Head Self-Attention
+    multi_head_attention(s, c, layer, x, x, x, seq_len, seq_len);
+
+    // Residual connection + Layer Norm
+    for (int i = 0; i < seq_len * c->dim; i++) {
+        s->attn_out[i] += x[i];
+    }
+    layer_norm(s->attn_out, s->attn_out, layer->attn_norm_gamma, layer->attn_norm_beta, seq_len, c->dim);
+
+    // Feed-Forward Network
+    feed_forward(s, c, layer, s->attn_out, seq_len);
+
+    // Residual connection + Layer Norm
+    for (int i = 0; i < seq_len * c->dim; i++) {
+        s->ffn_out[i] += s->attn_out[i];
+    }
+    layer_norm(s->attn_out, s->ffn_out, layer->ffn_norm_gamma, layer->ffn_norm_beta, seq_len, c->dim);
+}
+
+void encoder_forward(RunState* s, Config* c, Weights* w, int* phoneme_ids, int n_phonemes) {
+    // 1. Embedding lookup
+    for (int i = 0; i < n_phonemes; i++) {
+        int ph_id = phoneme_ids[i];
+        if (ph_id < 0 || ph_id >= c->vocab_size) {
+            fprintf(stderr, "Warning: Invalid phoneme ID %d at position %d\n", ph_id, i);
+            ph_id = 0;  // Use padding token
+        }
+        memcpy(s->encoder_emb + i * c->dim,
+               w->encoder_embedding + ph_id * c->dim,
+               c->dim * sizeof(float));
+    }
+
+    // 2. Add positional encoding
+    for (int i = 0; i < n_phonemes; i++) {
+        for (int j = 0; j < c->dim; j++) {
+            s->encoder_emb[i * c->dim + j] += w->encoder_pe[i * c->dim + j];
+        }
+    }
+
+    // 3. Pass through encoder layers
+    float* x = s->encoder_emb;
+    for (int layer = 0; layer < c->n_enc_layers; layer++) {
+        encoder_layer_forward(s, c, &w->encoder_layers[layer], x, n_phonemes);
+        x = s->attn_out;  // Output becomes input to next layer
+    }
+
+    // 4. Copy final output to encoder_out
+    memcpy(s->encoder_out, s->attn_out, n_phonemes * c->dim * sizeof(float));
+}
+
+// ============================================================================
+// Variance Adaptor Implementation
+// ============================================================================
+
+void variance_predictor_forward(RunState* s, Config* c, VariancePredictor* vp,
+                                float* x, int seq_len, float* output) {
+    // Variance predictor: 2 Conv1D layers + LayerNorm + Linear projection
+    int filter_size = c->var_pred_filter_size;
+    int kernel_size = c->var_pred_kernel_size;
+    int padding = kernel_size / 2;
+
+    // First Conv1D layer
+    // Input: [1, dim, seq_len] -> [1, filter_size, seq_len]
+    // Note: PyTorch conv1d expects [batch, channels, length]
+    // We need to transpose x from [seq_len, dim] to [1, dim, seq_len]
+
+    // For simplicity, we'll work with [batch=1, channels, seq_len] format
+    conv1d(s->conv_buf1, x, vp->conv1_weight, vp->conv1_bias,
+           1, c->dim, filter_size, seq_len, kernel_size, padding);
+
+    // ReLU activation
+    relu(s->conv_buf1, seq_len * filter_size);
+
+    // Layer Norm 1
+    layer_norm(s->conv_buf1, s->conv_buf1, vp->ln1_gamma, vp->ln1_beta, seq_len, filter_size);
+
+    // Second Conv1D layer
+    conv1d(s->conv_buf2, s->conv_buf1, vp->conv2_weight, vp->conv2_bias,
+           1, filter_size, filter_size, seq_len, kernel_size, padding);
+
+    // ReLU activation
+    relu(s->conv_buf2, seq_len * filter_size);
+
+    // Layer Norm 2
+    layer_norm(s->conv_buf2, s->conv_buf2, vp->ln2_gamma, vp->ln2_beta, seq_len, filter_size);
+
+    // Linear projection: [seq_len, filter_size] -> [seq_len, 1]
+    for (int i = 0; i < seq_len; i++) {
+        float sum = 0.0f;
+        for (int j = 0; j < filter_size; j++) {
+            sum += s->conv_buf2[i * filter_size + j] * vp->linear_weight[j];
+        }
+        output[i] = sum + vp->linear_bias[0];
+    }
+}
+
+void variance_adaptor_forward(RunState* s, Config* c, Weights* w, int n_phonemes) {
+    // 1. Predict duration, pitch, energy
+    variance_predictor_forward(s, c, &w->duration_predictor, s->encoder_out, n_phonemes, s->duration_pred);
+    variance_predictor_forward(s, c, &w->pitch_predictor, s->encoder_out, n_phonemes, s->pitch_pred);
+    variance_predictor_forward(s, c, &w->energy_predictor, s->encoder_out, n_phonemes, s->energy_pred);
+
+    // 2. Quantize and embed pitch/energy (phoneme-level)
+    for (int i = 0; i < n_phonemes; i++) {
+        // Quantize predictions to bin indices
+        int pitch_bin = quantize_value(s->pitch_pred[i], c->pitch_min, c->pitch_max, c->n_bins);
+        int energy_bin = quantize_value(s->energy_pred[i], c->energy_min, c->energy_max, c->n_bins);
+
+        // Add pitch and energy embeddings to encoder output
+        for (int j = 0; j < c->dim; j++) {
+            s->encoder_out[i * c->dim + j] += w->pitch_embedding[pitch_bin * c->dim + j];
+            s->encoder_out[i * c->dim + j] += w->energy_embedding[energy_bin * c->dim + j];
+        }
+    }
+
+    // 3. Length Regulation - expand phoneme sequence to mel frames
+    s->mel_len = 0;
+    for (int i = 0; i < n_phonemes; i++) {
+        // Round duration prediction
+        s->durations[i] = (int)(s->duration_pred[i] + 0.5f);
+        if (s->durations[i] < 1) s->durations[i] = 1;  // Minimum duration is 1
+
+        // Repeat phoneme representation duration[i] times
+        for (int d = 0; d < s->durations[i]; d++) {
+            memcpy(s->variance_out + s->mel_len * c->dim,
+                   s->encoder_out + i * c->dim,
+                   c->dim * sizeof(float));
+            s->mel_len++;
+        }
+    }
+}
+
+// ============================================================================
+// Decoder Implementation
+// ============================================================================
+
+void decoder_layer_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len) {
+    // Same structure as encoder layer
+    encoder_layer_forward(s, c, layer, x, seq_len);
+}
+
+void decoder_forward(RunState* s, Config* c, Weights* w, int mel_len) {
+    // 1. Add positional encoding to variance adaptor output
+    for (int i = 0; i < mel_len; i++) {
+        for (int j = 0; j < c->dim; j++) {
+            s->variance_out[i * c->dim + j] += w->decoder_pe[i * c->dim + j];
+        }
+    }
+
+    // 2. Pass through decoder layers
+    float* x = s->variance_out;
+    for (int layer = 0; layer < c->n_dec_layers; layer++) {
+        decoder_layer_forward(s, c, &w->decoder_layers[layer], x, mel_len);
+        x = s->attn_out;  // Output becomes input to next layer
+    }
+
+    // 3. Copy final output to decoder_out
+    memcpy(s->decoder_out, s->attn_out, mel_len * c->dim * sizeof(float));
+
+    // 4. Project to mel-spectrogram: [mel_len, dim] -> [mel_len, n_mels]
+    matmul(s->mel_out, s->decoder_out, w->mel_linear_weight, mel_len, c->dim, c->n_mels);
+
+    // Add bias
+    for (int i = 0; i < mel_len; i++) {
+        for (int j = 0; j < c->n_mels; j++) {
+            s->mel_out[i * c->n_mels + j] += w->mel_linear_bias[j];
+        }
+    }
+}
+
+// ============================================================================
+// PostNet Implementation
+// ============================================================================
+
+void postnet_forward(RunState* s, Config* c, Weights* w, int mel_len) {
+    // PostNet: 5 Conv1D layers with BatchNorm
+    int n_convs = c->postnet_n_convolutions;
+    int embedding_dim = c->postnet_embedding_dim;
+    int kernel_size = c->postnet_kernel_size;
+    int padding = kernel_size / 2;
+
+    // First layer: [mel_len, n_mels] -> [mel_len, postnet_embedding_dim]
+    conv1d(s->conv_buf1, s->mel_out, w->postnet_layers[0].conv_weight, w->postnet_layers[0].conv_bias,
+           1, c->n_mels, embedding_dim, mel_len, kernel_size, padding);
+
+    batch_norm(s->conv_buf1, s->conv_buf1,
+               w->postnet_layers[0].bn_gamma, w->postnet_layers[0].bn_beta,
+               w->postnet_layers[0].bn_mean, w->postnet_layers[0].bn_var,
+               mel_len, embedding_dim);
+
+    tanh_activation(s->conv_buf1, mel_len * embedding_dim);
+
+    // Middle layers: [mel_len, postnet_embedding_dim] -> [mel_len, postnet_embedding_dim]
+    for (int i = 1; i < n_convs - 1; i++) {
+        float* in_buf = (i % 2 == 1) ? s->conv_buf1 : s->conv_buf2;
+        float* out_buf = (i % 2 == 1) ? s->conv_buf2 : s->conv_buf1;
+
+        conv1d(out_buf, in_buf, w->postnet_layers[i].conv_weight, w->postnet_layers[i].conv_bias,
+               1, embedding_dim, embedding_dim, mel_len, kernel_size, padding);
+
+        batch_norm(out_buf, out_buf,
+                   w->postnet_layers[i].bn_gamma, w->postnet_layers[i].bn_beta,
+                   w->postnet_layers[i].bn_mean, w->postnet_layers[i].bn_var,
+                   mel_len, embedding_dim);
+
+        tanh_activation(out_buf, mel_len * embedding_dim);
+    }
+
+    // Last layer: [mel_len, postnet_embedding_dim] -> [mel_len, n_mels]
+    float* last_in = ((n_convs - 2) % 2 == 1) ? s->conv_buf2 : s->conv_buf1;
+    float* temp_out = s->conv_buf2;  // Use conv_buf2 as temporary
+
+    conv1d(temp_out, last_in, w->postnet_layers[n_convs - 1].conv_weight,
+           w->postnet_layers[n_convs - 1].conv_bias,
+           1, embedding_dim, c->n_mels, mel_len, kernel_size, padding);
+
+    batch_norm(temp_out, temp_out,
+               w->postnet_layers[n_convs - 1].bn_gamma, w->postnet_layers[n_convs - 1].bn_beta,
+               w->postnet_layers[n_convs - 1].bn_mean, w->postnet_layers[n_convs - 1].bn_var,
+               mel_len, c->n_mels);
+
+    // No tanh for the last layer
+
+    // Add residual connection: postnet_out = mel_out + postnet_output
+    for (int i = 0; i < mel_len * c->n_mels; i++) {
+        s->postnet_mel_out[i] = s->mel_out[i] + temp_out[i];
+    }
+}
+
+// ============================================================================
+// Main Inference Function
+// ============================================================================
+
+void fastspeech2_forward(RunState* s, Config* c, Weights* w,
+                        int* phoneme_ids, int n_phonemes) {
+    printf("Running FastSpeech2 inference...\n");
+    printf("  Input: %d phonemes\n", n_phonemes);
+
+    // 1. Encoder
+    encoder_forward(s, c, w, phoneme_ids, n_phonemes);
+    printf("  ✓ Encoder complete\n");
+
+    // 2. Variance Adaptor (includes Length Regulation)
+    variance_adaptor_forward(s, c, w, n_phonemes);
+    printf("  ✓ Variance Adaptor complete (mel_len=%d)\n", s->mel_len);
+
+    // 3. Decoder
+    decoder_forward(s, c, w, s->mel_len);
+    printf("  ✓ Decoder complete\n");
+
+    // 4. PostNet
+    postnet_forward(s, c, w, s->mel_len);
+    printf("  ✓ PostNet complete\n");
+
+    printf("FastSpeech2 inference complete! Output shape: [%d, %d]\n",
+           s->mel_len, c->n_mels);
+}
