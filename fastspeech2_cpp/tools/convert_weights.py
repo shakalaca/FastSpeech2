@@ -1,42 +1,268 @@
 #!/usr/bin/env python3
-"""
-Convert PyTorch FastSpeech2 model weights to binary format for C++ inference.
-
-Usage:
-    python tools/convert_weights.py --checkpoint <path_to_checkpoint.pth.tar> \\
-                                     --preprocess_config <path_to_preprocess.yaml> \\
-                                     --model_config <path_to_model.yaml> \\
-                                     --output_dir <output_directory>
-"""
+"""Minimal FastSpeech2 weight converter implemented without PyTorch runtime."""
 
 import argparse
-import os
 import json
-import yaml
-import torch
-import numpy as np
+import os
+import pickle
+import struct
+import tarfile
+import tempfile
+import zipfile
+from array import array
+from collections import OrderedDict
 from pathlib import Path
+from typing import Any, Dict, Iterable, Tuple
+
+import yaml
 
 
-def save_tensor(tensor, filepath):
-    """Save a PyTorch tensor as binary float32 file."""
+STORAGE_DTYPES = {
+    "torch.FloatStorage": ("f", 4, "float32"),
+    "torch.LongStorage": ("q", 8, "int64"),
+}
+
+
+class FakeNumpyDtype:
+    """Lightweight stand-in for numpy.dtype used during unpickling."""
+
+    def __init__(self, descriptor, *args, **kwargs):
+        self.descriptor = descriptor
+        self.args = args
+        self.kwargs = kwargs
+        self.state = None
+
+    def __setstate__(self, state):
+        self.state = state
+
+
+class Storage:
+    """Represents a tensor storage block stored on disk."""
+
+    def __init__(self, file_path: Path, storage_type: str, size: int):
+        self.file_path = Path(file_path)
+        self.storage_type = storage_type
+        self.typecode, self.itemsize, self.dtype = STORAGE_DTYPES[storage_type]
+        self.size = size
+        self._array: array | None = None
+
+    def load(self) -> array:
+        """Materialize the storage into memory."""
+        if self._array is None:
+            data = self.file_path.read_bytes()
+            arr = array(self.typecode)
+            arr.frombytes(data)
+            if len(arr) != self.size:
+                raise ValueError(
+                    f"Storage size mismatch for {self.file_path.name}: expected "
+                    f"{self.size}, found {len(arr)}"
+                )
+            self._array = arr
+        return self._array
+
+
+class TensorData:
+    """Minimal tensor handle holding metadata and storage reference."""
+
+    def __init__(
+        self,
+        storage: Storage,
+        offset: int,
+        size: Iterable[int],
+        stride: Iterable[int],
+    ):
+        self.storage = storage
+        self.offset = offset
+        self.size = tuple(int(dim) for dim in size)
+        self.stride = tuple(int(step) for step in stride)
+        self.dtype = storage.dtype
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return self.size
+
+    def numel(self) -> int:
+        product = 1
+        for dim in self.size:
+            product *= dim
+        return product
+
+    def is_contiguous(self) -> bool:
+        expected = 1
+        for dim, stride in zip(reversed(self.size), reversed(self.stride)):
+            if dim == 0:
+                return True
+            if stride != expected:
+                return False
+            expected *= dim
+        return True
+
+    def ensure_materialized(self) -> None:
+        self.storage.load()
+
+    def to_float_array(self) -> array:
+        """Return tensor flattened as float32 array."""
+        if not self.is_contiguous():
+            raise ValueError("Non-contiguous tensors are not supported in this converter.")
+
+        data = self.storage.load()
+        start = self.offset
+        end = start + self.numel()
+        segment = data[start:end]
+
+        if self.dtype == "float32":
+            return segment
+
+        if self.dtype == "int64":
+            return array("f", (float(x) for x in segment))
+
+        raise ValueError(f"Unsupported dtype encountered: {self.dtype}")
+
+
+class TorchCheckpointUnpickler(pickle.Unpickler):
+    """Unpickler that recreates tensors without requiring torch or numpy."""
+
+    def __init__(self, file_obj, storage_dir: Path):
+        super().__init__(file_obj)
+        self.storage_dir = Path(storage_dir)
+
+    def find_class(self, module: str, name: str) -> Any:
+        if module == "torch._utils" and name == "_rebuild_tensor_v2":
+            return self._rebuild_tensor_v2
+
+        if module == "torch" and name in {"FloatStorage", "LongStorage"}:
+            # The actual storage objects are supplied via persistent IDs; return dummy.
+            stub = lambda *args, **kwargs: None  # noqa: E731
+            stub.__module__ = module
+            stub.__name__ = name
+            return stub
+
+        if module == "numpy" and name == "dtype":
+            return FakeNumpyDtype
+
+        if module == "numpy.core.multiarray" and name == "scalar":
+            return lambda dtype, value, state=None: value
+
+        return super().find_class(module, name)
+
+    def persistent_load(self, pid):
+        if isinstance(pid, tuple) and pid and pid[0] == "storage":
+            _, storage_type, key, _location, size = pid
+            if isinstance(storage_type, str):
+                storage_key = storage_type
+            else:
+                storage_key = f"{getattr(storage_type, '__module__', '')}.{getattr(storage_type, '__name__', '')}"
+            if storage_key not in STORAGE_DTYPES:
+                raise ValueError(f"Unsupported storage type: {storage_type}")
+            return Storage(self.storage_dir / key, storage_key, int(size))
+        raise ValueError(f"Unsupported persistent load id: {pid!r}")
+
+    @staticmethod
+    def _rebuild_tensor_v2(storage, storage_offset, size, stride, requires_grad, hooks):
+        del requires_grad, hooks
+        return TensorData(storage, int(storage_offset), size, stride)
+
+
+def extract_checkpoint(checkpoint_path: Path) -> Tuple[tempfile.TemporaryDirectory, Path]:
+    """Extract the checkpoint archive into a temporary directory and return archive root."""
+    temp_dir = tempfile.TemporaryDirectory()
+    base_path = Path(temp_dir.name)
+
+    path = Path(checkpoint_path)
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as zf:
+            zf.extractall(base_path)
+    else:
+        with tarfile.open(path, "r:*") as archive:
+            archive.extractall(base_path)
+
+    # Some checkpoints nest another tarball; unwrap until data.pkl is found.
+    for depth in range(5):
+        data_pkl_candidates = list(base_path.rglob("data.pkl"))
+        if data_pkl_candidates:
+            return temp_dir, data_pkl_candidates[0].parent
+
+        zip_candidates = [
+            candidate
+            for candidate in base_path.iterdir()
+            if candidate.is_file() and zipfile.is_zipfile(candidate)
+        ]
+        if zip_candidates:
+            nested_dir = base_path / f"nested_zip_{depth}"
+            nested_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(zip_candidates[0]) as nested_zip:
+                nested_zip.extractall(nested_dir)
+            base_path = nested_dir
+            continue
+
+        tar_candidates = [
+            candidate for candidate in base_path.iterdir() if candidate.is_file() and candidate.suffix == ".tar"
+        ]
+        if tar_candidates:
+            nested_dir = base_path / f"nested_tar_{depth}"
+            nested_dir.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(tar_candidates[0], "r:*") as nested_tar:
+                nested_tar.extractall(nested_dir)
+            base_path = nested_dir
+            continue
+
+        break
+
+    raise FileNotFoundError("Could not locate data.pkl in the checkpoint archive.")
+
+
+def load_state_dict(checkpoint_path: Path) -> OrderedDict:
+    """Load the model state dict using the custom unpickler."""
+    temp_dir, archive_root = extract_checkpoint(checkpoint_path)
+    checkpoint = None
+
+    try:
+        data_file = archive_root / "data.pkl"
+        storage_dir = archive_root / "data"
+        if not storage_dir.is_dir():
+            raise FileNotFoundError("Missing storage directory in checkpoint archive.")
+
+        with data_file.open("rb") as f:
+            unpickler = TorchCheckpointUnpickler(f, storage_dir)
+            checkpoint = unpickler.load()
+    finally:
+        # Ensure storages are loaded before cleaning up the temporary directory.
+        if isinstance(checkpoint, dict) and "model" in checkpoint:
+            model_state = checkpoint["model"]
+        elif isinstance(checkpoint, OrderedDict):
+            model_state = checkpoint
+        else:
+            model_state = None
+
+        if isinstance(model_state, OrderedDict):
+            for tensor in model_state.values():
+                if isinstance(tensor, TensorData):
+                    tensor.ensure_materialized()
+
+        temp_dir.cleanup()
+
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        return checkpoint["model"]
+
+    return checkpoint
+
+
+def save_tensor(tensor: TensorData, path: Path) -> None:
+    """Dump a tensor to float32 binary format."""
     if tensor is None:
         return
-    arr = tensor.detach().cpu().numpy().astype(np.float32)
-    arr.tofile(filepath)
-    print(f"  Saved {filepath.name}: {arr.shape}")
+    flat = tensor.to_float_array()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        flat.tofile(f)
 
 
-def save_config(preprocess_config, model_config, stats, output_dir):
-    """Save model configuration as binary file."""
-    config_path = os.path.join(output_dir, "config.bin")
+def write_config(preprocess_cfg, model_cfg, stats, out_dir: Path, overrides: Dict[str, int | float | None]):
+    transformer = model_cfg["transformer"]
+    variance_predictor = model_cfg["variance_predictor"]
+    variance_embedding = model_cfg["variance_embedding"]
+    postnet_cfg = model_cfg.get("postnet", {})
 
-    # Extract configuration values
-    transformer = model_config["transformer"]
-    variance_predictor = model_config["variance_predictor"]
-    variance_embedding = model_config["variance_embedding"]
-
-    # Prepare config struct (matches C++ Config structure)
     config = {
         "dim": transformer["encoder_hidden"],
         "n_enc_layers": transformer["encoder_layer"],
@@ -44,284 +270,195 @@ def save_config(preprocess_config, model_config, stats, output_dir):
         "n_heads": transformer["encoder_head"],
         "head_dim": transformer["encoder_hidden"] // transformer["encoder_head"],
         "ffn_hidden": transformer["conv_filter_size"],
-
-        "vocab_size": 300,  # Will be updated if we can determine actual size
-        "n_mels": preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
-        "max_seq_len": model_config["max_seq_len"],
-
+        "vocab_size": model_cfg.get("vocab_size", 300),
+        "n_mels": preprocess_cfg["preprocessing"]["mel"]["n_mel_channels"],
+        "max_seq_len": model_cfg["max_seq_len"],
         "var_pred_filter_size": variance_predictor["filter_size"],
         "var_pred_kernel_size": variance_predictor["kernel_size"],
         "var_pred_dropout": variance_predictor["dropout"],
         "n_bins": variance_embedding["n_bins"],
-
-        "postnet_embedding_dim": model_config["postnet"]["postnet_embedding_dim"],
-        "postnet_kernel_size": model_config["postnet"]["postnet_kernel_size"],
-        "postnet_n_convolutions": model_config["postnet"]["postnet_n_convolutions"],
-
+        "postnet_embedding_dim": postnet_cfg.get("postnet_embedding_dim", transformer["encoder_hidden"]),
+        "postnet_kernel_size": postnet_cfg.get("postnet_kernel_size", 5),
+        "postnet_n_convolutions": postnet_cfg.get("postnet_n_convolutions", 5),
         "pitch_min": float(stats["pitch"][0]),
         "pitch_max": float(stats["pitch"][1]),
         "energy_min": float(stats["energy"][0]),
         "energy_max": float(stats["energy"][1]),
     }
 
-    # Save as binary file (int and float values)
-    with open(config_path, "wb") as f:
-        # Write integers (11 ints)
-        for key in ["dim", "n_enc_layers", "n_dec_layers", "n_heads", "head_dim",
-                    "ffn_hidden", "vocab_size", "n_mels", "max_seq_len",
-                    "var_pred_filter_size", "var_pred_kernel_size"]:
-            f.write(np.int32(config[key]).tobytes())
+    for key, value in overrides.items():
+        if value is not None:
+            config[key] = value
 
-        # Write floats (5 floats: var_pred_dropout + 4 stats)
-        for key in ["var_pred_dropout", "pitch_min", "pitch_max",
-                    "energy_min", "energy_max"]:
-            f.write(np.float32(config[key]).tobytes())
+    int_keys_1 = [
+        "dim",
+        "n_enc_layers",
+        "n_dec_layers",
+        "n_heads",
+        "head_dim",
+        "ffn_hidden",
+        "vocab_size",
+        "n_mels",
+        "max_seq_len",
+        "var_pred_filter_size",
+        "var_pred_kernel_size",
+    ]
+    float_keys = ["var_pred_dropout", "pitch_min", "pitch_max", "energy_min", "energy_max"]
+    int_keys_2 = ["n_bins", "postnet_embedding_dim", "postnet_kernel_size", "postnet_n_convolutions"]
 
-        # Write remaining ints (2 ints)
-        for key in ["n_bins", "postnet_embedding_dim", "postnet_kernel_size",
-                    "postnet_n_convolutions"]:
-            f.write(np.int32(config[key]).tobytes())
+    out_dir.mkdir(parents=True, exist_ok=True)
+    config_path = out_dir / "config.bin"
+    with config_path.open("wb") as f:
+        f.write(struct.pack("<" + "i" * len(int_keys_1), *[int(config[k]) for k in int_keys_1]))
+        f.write(struct.pack("<" + "f" * len(float_keys), *[float(config[k]) for k in float_keys]))
+        f.write(struct.pack("<" + "i" * len(int_keys_2), *[int(config[k]) for k in int_keys_2]))
 
-    print(f"✓ Saved config to {config_path}")
-    print(f"  Config: dim={config['dim']}, enc_layers={config['n_enc_layers']}, "
-          f"dec_layers={config['n_dec_layers']}, n_mels={config['n_mels']}")
-
+    print(f"Saved config: {config_path}")
     return config
 
 
-def convert_variance_predictor(state_dict, prefix, output_dir, name):
-    """Convert a variance predictor's weights."""
-    vp_dir = output_dir / name
-    vp_dir.mkdir(exist_ok=True)
+def dump_variance_predictor(state_dict: OrderedDict, prefix: str, out_dir: Path):
+    files = {
+        "conv1_weight.bin": f"{prefix}.conv_layer.conv1d_1.conv.weight",
+        "conv1_bias.bin": f"{prefix}.conv_layer.conv1d_1.conv.bias",
+        "conv2_weight.bin": f"{prefix}.conv_layer.conv1d_2.conv.weight",
+        "conv2_bias.bin": f"{prefix}.conv_layer.conv1d_2.conv.bias",
+        "ln1_gamma.bin": f"{prefix}.conv_layer.layer_norm_1.weight",
+        "ln1_beta.bin": f"{prefix}.conv_layer.layer_norm_1.bias",
+        "ln2_gamma.bin": f"{prefix}.conv_layer.layer_norm_2.weight",
+        "ln2_beta.bin": f"{prefix}.conv_layer.layer_norm_2.bias",
+        "linear_weight.bin": f"{prefix}.linear_layer.weight",
+        "linear_bias.bin": f"{prefix}.linear_layer.bias",
+    }
 
-    print(f"\n  Converting {name}...")
-
-    # Conv layers
-    save_tensor(state_dict[f"{prefix}.conv_layer.0.conv.weight"],
-                vp_dir / "conv1_weight.bin")
-    save_tensor(state_dict[f"{prefix}.conv_layer.0.conv.bias"],
-                vp_dir / "conv1_bias.bin")
-    save_tensor(state_dict[f"{prefix}.conv_layer.1.conv.weight"],
-                vp_dir / "conv2_weight.bin")
-    save_tensor(state_dict[f"{prefix}.conv_layer.1.conv.bias"],
-                vp_dir / "conv2_bias.bin")
-
-    # Layer norms
-    save_tensor(state_dict[f"{prefix}.conv_layer.0.layer_norm.weight"],
-                vp_dir / "ln1_gamma.bin")
-    save_tensor(state_dict[f"{prefix}.conv_layer.0.layer_norm.bias"],
-                vp_dir / "ln1_beta.bin")
-    save_tensor(state_dict[f"{prefix}.conv_layer.1.layer_norm.weight"],
-                vp_dir / "ln2_gamma.bin")
-    save_tensor(state_dict[f"{prefix}.conv_layer.1.layer_norm.bias"],
-                vp_dir / "ln2_beta.bin")
-
-    # Linear projection
-    save_tensor(state_dict[f"{prefix}.linear_layer.weight"],
-                vp_dir / "linear_weight.bin")
-    save_tensor(state_dict[f"{prefix}.linear_layer.bias"],
-                vp_dir / "linear_bias.bin")
+    for filename, key in files.items():
+        save_tensor(state_dict[key], out_dir / filename)
 
 
-def convert_fft_layer(state_dict, prefix, output_dir, layer_idx):
-    """Convert an encoder/decoder FFT layer."""
-    layer_dir = output_dir / f"layer_{layer_idx}"
-    layer_dir.mkdir(exist_ok=True)
+def dump_fft_layer(state_dict: OrderedDict, prefix: str, out_dir: Path, index: int):
+    files = {
+        "attn_q_weight.bin": f"{prefix}.{index}.slf_attn.w_qs.weight",
+        "attn_q_bias.bin": f"{prefix}.{index}.slf_attn.w_qs.bias",
+        "attn_k_weight.bin": f"{prefix}.{index}.slf_attn.w_ks.weight",
+        "attn_k_bias.bin": f"{prefix}.{index}.slf_attn.w_ks.bias",
+        "attn_v_weight.bin": f"{prefix}.{index}.slf_attn.w_vs.weight",
+        "attn_v_bias.bin": f"{prefix}.{index}.slf_attn.w_vs.bias",
+        "attn_out_weight.bin": f"{prefix}.{index}.slf_attn.fc.weight",
+        "attn_out_bias.bin": f"{prefix}.{index}.slf_attn.fc.bias",
+        "attn_norm_gamma.bin": f"{prefix}.{index}.slf_attn.layer_norm.weight",
+        "attn_norm_beta.bin": f"{prefix}.{index}.slf_attn.layer_norm.bias",
+        "ffn_w1.bin": f"{prefix}.{index}.pos_ffn.w_1.weight",
+        "ffn_b1.bin": f"{prefix}.{index}.pos_ffn.w_1.bias",
+        "ffn_w2.bin": f"{prefix}.{index}.pos_ffn.w_2.weight",
+        "ffn_b2.bin": f"{prefix}.{index}.pos_ffn.w_2.bias",
+        "ffn_norm_gamma.bin": f"{prefix}.{index}.pos_ffn.layer_norm.weight",
+        "ffn_norm_beta.bin": f"{prefix}.{index}.pos_ffn.layer_norm.bias",
+    }
 
-    # Multi-Head Attention
-    # Note: PyTorch MultiheadAttention uses in_proj_weight (combined Q, K, V)
-    # We need to split it
-    in_proj_weight = state_dict[f"{prefix}.{layer_idx}.slf_attn.w_qs.weight"]
-    dim = in_proj_weight.shape[0]
-
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.slf_attn.w_qs.weight"],
-                layer_dir / "attn_q_weight.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.slf_attn.w_qs.bias"],
-                layer_dir / "attn_q_bias.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.slf_attn.w_ks.weight"],
-                layer_dir / "attn_k_weight.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.slf_attn.w_ks.bias"],
-                layer_dir / "attn_k_bias.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.slf_attn.w_vs.weight"],
-                layer_dir / "attn_v_weight.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.slf_attn.w_vs.bias"],
-                layer_dir / "attn_v_bias.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.slf_attn.fc.weight"],
-                layer_dir / "attn_out_weight.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.slf_attn.fc.bias"],
-                layer_dir / "attn_out_bias.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.slf_attn.layer_norm.weight"],
-                layer_dir / "attn_norm_gamma.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.slf_attn.layer_norm.bias"],
-                layer_dir / "attn_norm_beta.bin")
-
-    # Feed-Forward Network
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.pos_ffn.w_1.weight"],
-                layer_dir / "ffn_w1.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.pos_ffn.w_1.bias"],
-                layer_dir / "ffn_b1.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.pos_ffn.w_2.weight"],
-                layer_dir / "ffn_w2.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.pos_ffn.w_2.bias"],
-                layer_dir / "ffn_b2.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.pos_ffn.layer_norm.weight"],
-                layer_dir / "ffn_norm_gamma.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.pos_ffn.layer_norm.bias"],
-                layer_dir / "ffn_norm_beta.bin")
+    layer_dir = out_dir / f"layer_{index}"
+    for filename, key in files.items():
+        save_tensor(state_dict[key], layer_dir / filename)
 
 
-def convert_postnet_layer(state_dict, prefix, output_dir, layer_idx):
-    """Convert a PostNet layer."""
-    layer_dir = output_dir / f"layer_{layer_idx}"
-    layer_dir.mkdir(exist_ok=True)
+def dump_postnet_layer(state_dict: OrderedDict, prefix: str, out_dir: Path, index: int):
+    files = {
+        "conv_weight.bin": f"{prefix}.{index}.0.conv.weight",
+        "conv_bias.bin": f"{prefix}.{index}.0.conv.bias",
+        "bn_gamma.bin": f"{prefix}.{index}.1.weight",
+        "bn_beta.bin": f"{prefix}.{index}.1.bias",
+        "bn_mean.bin": f"{prefix}.{index}.1.running_mean",
+        "bn_var.bin": f"{prefix}.{index}.1.running_var",
+    }
 
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.0.weight"],
-                layer_dir / "conv_weight.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.0.bias"],
-                layer_dir / "conv_bias.bin")
-
-    # Batch normalization
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.1.weight"],
-                layer_dir / "bn_gamma.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.1.bias"],
-                layer_dir / "bn_beta.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.1.running_mean"],
-                layer_dir / "bn_mean.bin")
-    save_tensor(state_dict[f"{prefix}.{layer_idx}.1.running_var"],
-                layer_dir / "bn_var.bin")
+    layer_dir = out_dir / f"layer_{index}"
+    for filename, key in files.items():
+        save_tensor(state_dict[key], layer_dir / filename)
 
 
-def convert_model(checkpoint_path, preprocess_config, model_config, output_dir):
-    """Convert complete FastSpeech2 model."""
-    print(f"\nLoading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = checkpoint["model"]
+def convert_model(checkpoint_path: Path, preprocess_cfg, model_cfg, output_dir: Path):
+    state_dict = load_state_dict(checkpoint_path)
 
-    print(f"Model keys: {len(state_dict.keys())}")
+    stats_path = Path(preprocess_cfg["path"]["preprocessed_path"]) / "stats.json"
+    if stats_path.is_file():
+        stats = json.loads(stats_path.read_text())
+    else:
+        stats = {"pitch": [0.0, 0.0], "energy": [0.0, 0.0]}
 
-    # Load stats
-    stats_path = os.path.join(
-        preprocess_config["path"]["preprocessed_path"], "stats.json"
-    )
-    with open(stats_path) as f:
-        stats = json.load(f)
+    out_dir = Path(output_dir)
+    encoder_dir = out_dir / "encoder"
+    variance_dir = out_dir / "variance_adaptor"
+    decoder_dir = out_dir / "decoder"
+    postnet_dir = out_dir / "postnet"
 
-    # Create output directory structure
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    for folder in (out_dir, encoder_dir, variance_dir, decoder_dir, postnet_dir):
+        folder.mkdir(parents=True, exist_ok=True)
 
-    encoder_dir = output_path / "encoder"
-    encoder_dir.mkdir(exist_ok=True)
+    vocab_size = state_dict["encoder.src_word_emb.weight"].shape[0]
 
-    variance_dir = output_path / "variance_adaptor"
-    variance_dir.mkdir(exist_ok=True)
+    postnet_layers = [
+        key
+        for key in state_dict.keys()
+        if key.startswith("postnet.convolutions.") and key.endswith(".0.conv.weight")
+    ]
+    postnet_count = len(postnet_layers)
+    postnet_kernel = None
+    postnet_dim = None
+    if postnet_layers:
+        sample = state_dict[postnet_layers[0]]
+        postnet_kernel = sample.shape[-1]
+        postnet_dim = sample.shape[0] if postnet_count == 1 else state_dict[postnet_layers[1]].shape[0]
 
-    decoder_dir = output_path / "decoder"
-    decoder_dir.mkdir(exist_ok=True)
+    pitch_embedding = state_dict.get("variance_adaptor.pitch_embedding.weight")
+    n_bins = pitch_embedding.shape[0] if pitch_embedding else None
 
-    postnet_dir = output_path / "postnet"
-    postnet_dir.mkdir(exist_ok=True)
+    overrides = {
+        "vocab_size": vocab_size,
+        "postnet_n_convolutions": postnet_count if postnet_count else None,
+        "postnet_embedding_dim": postnet_dim,
+        "postnet_kernel_size": postnet_kernel,
+        "n_bins": n_bins,
+    }
 
-    # Save configuration
-    config = save_config(preprocess_config, model_config, stats, output_dir)
+    config = write_config(preprocess_cfg, model_cfg, stats, out_dir, overrides)
 
-    print("\n=== Converting Encoder ===")
-    # Encoder embedding
-    save_tensor(state_dict["encoder.src_word_emb.weight"],
-                encoder_dir / "embedding.bin")
+    save_tensor(state_dict["encoder.src_word_emb.weight"], encoder_dir / "embedding.bin")
 
-    # Encoder positional encoding (generated, not learned)
-    print("  Note: Positional encoding will be generated in C++")
+    for i in range(config["n_enc_layers"]):
+        dump_fft_layer(state_dict, "encoder.layer_stack", encoder_dir, i)
 
-    # Encoder layers
-    n_enc_layers = config["n_enc_layers"]
-    for i in range(n_enc_layers):
-        print(f"  Converting encoder layer {i}...")
-        convert_fft_layer(state_dict, "encoder.layer_stack", encoder_dir, i)
+    dump_variance_predictor(state_dict, "variance_adaptor.duration_predictor", variance_dir / "duration_predictor")
+    dump_variance_predictor(state_dict, "variance_adaptor.pitch_predictor", variance_dir / "pitch_predictor")
+    dump_variance_predictor(state_dict, "variance_adaptor.energy_predictor", variance_dir / "energy_predictor")
 
-    print("\n=== Converting Variance Adaptor ===")
-    convert_variance_predictor(state_dict, "variance_adaptor.duration_predictor",
-                               variance_dir, "duration_predictor")
-    convert_variance_predictor(state_dict, "variance_adaptor.pitch_predictor",
-                               variance_dir, "pitch_predictor")
-    convert_variance_predictor(state_dict, "variance_adaptor.energy_predictor",
-                               variance_dir, "energy_predictor")
+    save_tensor(state_dict["variance_adaptor.pitch_embedding.weight"], variance_dir / "pitch_embedding.bin")
+    save_tensor(state_dict["variance_adaptor.energy_embedding.weight"], variance_dir / "energy_embedding.bin")
 
-    # Pitch and energy embeddings
-    save_tensor(state_dict["variance_adaptor.pitch_embedding.weight"],
-                variance_dir / "pitch_embedding.bin")
-    save_tensor(state_dict["variance_adaptor.energy_embedding.weight"],
-                variance_dir / "energy_embedding.bin")
+    for i in range(config["n_dec_layers"]):
+        dump_fft_layer(state_dict, "decoder.layer_stack", decoder_dir, i)
 
-    print("\n=== Converting Decoder ===")
-    # Decoder layers
-    n_dec_layers = config["n_dec_layers"]
-    for i in range(n_dec_layers):
-        print(f"  Converting decoder layer {i}...")
-        convert_fft_layer(state_dict, "decoder.layer_stack", decoder_dir, i)
+    save_tensor(state_dict["mel_linear.weight"], out_dir / "mel_linear_weight.bin")
+    save_tensor(state_dict["mel_linear.bias"], out_dir / "mel_linear_bias.bin")
 
-    # Mel linear projection
-    save_tensor(state_dict["mel_linear.weight"],
-                output_path / "mel_linear_weight.bin")
-    save_tensor(state_dict["mel_linear.bias"],
-                output_path / "mel_linear_bias.bin")
+    for i in range(config["postnet_n_convolutions"]):
+        dump_postnet_layer(state_dict, "postnet.convolutions", postnet_dir, i)
 
-    print("\n=== Converting PostNet ===")
-    n_postnet_layers = config["postnet_n_convolutions"]
-    for i in range(n_postnet_layers):
-        print(f"  Converting PostNet layer {i}...")
-        convert_postnet_layer(state_dict, "postnet.conv_list", postnet_dir, i)
-
-    print(f"\n✓ Conversion complete! Weights saved to {output_dir}")
-    print(f"\nDirectory structure:")
-    print(f"  {output_dir}/")
-    print(f"    ├── config.bin")
-    print(f"    ├── encoder/")
-    print(f"    ├── variance_adaptor/")
-    print(f"    ├── decoder/")
-    print(f"    └── postnet/")
+    print(f"Conversion finished. Output directory: {out_dir}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert FastSpeech2 PyTorch weights to C++ binary format"
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default="output/ckpt/LJSpeech/900000.pth.tar",
-        help="Path to PyTorch checkpoint file",
-    )
-    parser.add_argument(
-        "--preprocess_config",
-        type=str,
-        default="config/LJSpeech/preprocess.yaml",
-        help="Path to preprocess config YAML",
-    )
-    parser.add_argument(
-        "--model_config",
-        type=str,
-        default="config/LJSpeech/model.yaml",
-        help="Path to model config YAML",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="fastspeech2_cpp/weights",
-        help="Output directory for converted weights",
-    )
-
+    parser = argparse.ArgumentParser(description="Convert FastSpeech2 checkpoint to binary weights.")
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--preprocess_config", type=str, required=True)
+    parser.add_argument("--model_config", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="fastspeech2_cpp/weights")
     args = parser.parse_args()
 
-    # Load configs
     with open(args.preprocess_config) as f:
-        preprocess_config = yaml.load(f, Loader=yaml.FullLoader)
-
+        preprocess_cfg = yaml.load(f, Loader=yaml.FullLoader)
     with open(args.model_config) as f:
-        model_config = yaml.load(f, Loader=yaml.FullLoader)
+        model_cfg = yaml.load(f, Loader=yaml.FullLoader)
 
-    # Convert model
-    convert_model(args.checkpoint, preprocess_config, model_config, args.output_dir)
+    convert_model(Path(args.checkpoint), preprocess_cfg, model_cfg, Path(args.output_dir))
 
 
 if __name__ == "__main__":
