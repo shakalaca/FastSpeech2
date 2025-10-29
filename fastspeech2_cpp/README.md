@@ -25,6 +25,23 @@ Phoneme IDs → Encoder (4 layers) → Variance Adaptor → Length Regulation
 
 ## Quick Start
 
+### 0. Install Python Dependencies
+
+**Using virtual environment (recommended):**
+```bash
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+**Key dependencies:**
+- PyTorch 2.0.1 (CPU-only)
+- NumPy, PyYAML
+- g2p-en (text-to-phonemes)
+- gdown (model download)
+
+See [INSTALL.md](INSTALL.md) for detailed installation instructions.
+
 ### 1. Build
 
 ```bash
@@ -33,14 +50,24 @@ make build
 
 ### 2. Download Pretrained Model
 
-Download the LJSpeech model (900000 steps) from:
-https://drive.google.com/drive/folders/1DOhZGlTLMbbAAFZmZGDdc77kz1PloS7F
-
-Place `900000.pth.tar` in `../output/ckpt/LJSpeech/`
-
-Or use the helper script:
+**Option 1: Automatic download (recommended)**
 ```bash
-./tools/download_model.sh
+cd tools/
+./download_model.sh
+```
+
+The script will:
+- Automatically download the LJSpeech model (900000 steps) using `gdown`
+- Place `900000.pth.tar` in `../output/ckpt/LJSpeech/`
+- Verify the download and show next steps
+
+**Option 2: Manual download**
+1. Download from: https://drive.google.com/file/d/1r3fYhnblBJ8hDKDSUDtidJ-BN-xAM9pe/view
+2. Place `900000.pth.tar` in `../output/ckpt/LJSpeech/`
+
+**Note**: If you don't have `gdown` installed:
+```bash
+pip3 install gdown
 ```
 
 ### 3. Convert Weights
