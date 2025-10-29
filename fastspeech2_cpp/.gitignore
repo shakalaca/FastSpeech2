@@ -1,0 +1,25 @@
+# Compiled binaries
+fastspeech2
+fastspeech2_debug
+test_ops
+test_components
+test_integration
+
+# Object files
+*.o
+
+# Debug outputs
+debug/*.bin
+debug/*.png
+debug/*.txt
+
+# Test data (too large to commit)
+test/data/*.bin
+test/data/*.txt
+
+# Converted weights (too large to commit)
+weights/
+
+# Output files
+*.mel
+output*.bin
