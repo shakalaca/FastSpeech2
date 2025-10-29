@@ -7,7 +7,7 @@ establish component-level parity. It saves tensor snapshots as .npy
 files under the specified output directory.
 
 Example:
-    python3 tools/dump_pytorch_intermediates.py \
+    python3 tools/parity/dump_pytorch_intermediates.py \
         --checkpoint ../output/ckpt/LJSpeech/900000.pth.tar \
         --preprocess_config ../config/LJSpeech/preprocess.yaml \
         --model_config ../config/LJSpeech/model.yaml \
@@ -34,7 +34,14 @@ import torch.nn.functional as F
 import yaml
 
 
-ROOT = Path(__file__).resolve().parents[2]
+def find_repo_root(start: Path) -> Path:
+    for path in [start, *start.parents]:
+        if (path / "model").is_dir():
+            return path
+    raise RuntimeError(f"Could not locate project root from {start}")
+
+
+ROOT = find_repo_root(Path(__file__).resolve())
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

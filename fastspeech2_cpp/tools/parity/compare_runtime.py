@@ -6,7 +6,7 @@ utterance through both implementations and reports the numerical differences
 between the mel-spectrogram outputs.
 
 Example:
-    python3 tools/compare_runtime.py \
+    python3 tools/parity/compare_runtime.py \
         --checkpoint ../output/ckpt/LJSpeech/900000.pth.tar \
         --preprocess_config ../config/LJSpeech/preprocess.yaml \
         --model_config ../config/LJSpeech/model.yaml \
@@ -33,7 +33,15 @@ import numpy as np
 import torch
 import yaml
 
-ROOT = Path(__file__).resolve().parents[2]
+
+def find_repo_root(start: Path) -> Path:
+    for path in [start, *start.parents]:
+        if (path / "model").is_dir():
+            return path
+    raise RuntimeError(f"Could not locate project root from {start}")
+
+
+ROOT = find_repo_root(Path(__file__).resolve())
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

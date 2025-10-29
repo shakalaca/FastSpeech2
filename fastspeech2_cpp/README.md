@@ -5,11 +5,14 @@ It mirrors the original PyTorch implementation (ming024/FastSpeech2) and ships w
 tools to convert checkpoints and prepare inputs.
 
 ## Directory Overview
-- `fastspeech2.cpp`, `op.cpp`, `fastspeech2.h`, `op.h` – core model implementation and math ops
-- `main.cpp` – CLI entry point
-- `Makefile` – build, debug, and test targets
+- `src/` – C++ sources and headers for the runtime (`main.cpp`, `fastspeech2.cpp`, `op.cpp`, etc.)
+- `CMakeLists.txt` – CMake build definition (outputs to `build/` and drops binaries in `build/bin/`)
 - `weights/` – binary weights produced by the conversion scripts
-- `tools/` – Python utilities (checkpoint conversion, phoneme conversion, sanity checks)
+- `tools/` – Python utilities, organised as:
+  - root: env setup helpers (`convert_weights.py`, `text_to_phonemes.py`, `download_model.sh`, `verify_weights.py`)
+  - `parity/`: PyTorch ⇔ C++ comparison helpers (`compare_runtime.py`, `compare_dumps.py`, `dump_pytorch_intermediates.py`)
+  - `golden/`: scripts used when regenerating reference/golden data for C++ tests
+- `test_data/` – cached dumps from parity checks (safe to delete)
 - `requirements.txt` – Python dependencies needed by the tools
 
 ## Quick Start
@@ -52,12 +55,12 @@ tools to convert checkpoints and prepare inputs.
 
 5. **(Optional) Compare C++ runtime with PyTorch output**
    ```bash
-   python3 tools/compare_runtime.py \
+   python3 tools/parity/compare_runtime.py \
      --checkpoint ../output/ckpt/LJSpeech/900000.pth.tar \
      --preprocess_config ../config/LJSpeech/preprocess.yaml \
      --model_config ../config/LJSpeech/model.yaml \
      --weights_dir weights \
-     --runtime ./fastspeech2 \
+     --runtime build/bin/fastspeech2 \
      --phonemes "23,15,8,32,45,12"
    ```
    The script runs both implementations and reports the maximum absolute/relative
@@ -66,7 +69,7 @@ tools to convert checkpoints and prepare inputs.
 6. **(Optional) Capture full intermediate dumps for parity debugging**
    1. Dump PyTorch tensors:
       ```bash
-      python3 tools/dump_pytorch_intermediates.py \
+      python3 tools/parity/dump_pytorch_intermediates.py \
         --checkpoint ../output/ckpt/LJSpeech/900000.pth.tar \
         --preprocess_config ../config/LJSpeech/preprocess.yaml \
         --model_config ../config/LJSpeech/model.yaml \
@@ -75,7 +78,7 @@ tools to convert checkpoints and prepare inputs.
       ```
    2. Run the C++ runtime with dumping enabled:
       ```bash
-      ./fastspeech2 \
+      build/bin/fastspeech2 \
         --config weights/config.bin \
         --weights weights \
         --phonemes "23,15,8,32,45,12" \
@@ -83,22 +86,23 @@ tools to convert checkpoints and prepare inputs.
       ```
    3. Compare every tensor:
       ```bash
-      python3 tools/compare_dumps.py \
+      python3 tools/parity/compare_dumps.py \
         --pytorch_dir test_data/py_ref \
         --cpp_dir test_data/cpp_dump
       ```
    The script reports max absolute/relative errors for each intermediate and exits
    non-zero if tolerances are exceeded.
 
-7. **Build the C++ binary**
+7. **Configure & build the C++ binary**
    ```bash
-   make build        # Produces ./fastspeech2
+   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+   cmake --build build
    ```
 
 8. **Run inference**
    - With phoneme IDs in a file (comma or whitespace separated):
      ```bash
-     ./fastspeech2 \
+     build/bin/fastspeech2 \
        --config weights/config.bin \
        --weights weights \
        --input test_input.txt \
@@ -106,7 +110,7 @@ tools to convert checkpoints and prepare inputs.
      ```
    - Passing phoneme IDs directly:
      ```bash
-     ./fastspeech2 \
+     build/bin/fastspeech2 \
        --config weights/config.bin \
        --weights weights \
        --phonemes "23, 15, 8, 32, 45, 12" \
@@ -122,7 +126,7 @@ tools to convert checkpoints and prepare inputs.
 
 ## Command-line Reference
 ```
-./fastspeech2 [OPTIONS]
+build/bin/fastspeech2 [OPTIONS]
   --config <path>    Required. Path to weights/config.bin.
   --weights <dir>    Required. Directory containing converted layer weights.
   --input <path>     Optional. Text file (comma/space separated) or binary int32 phoneme IDs.
@@ -138,9 +142,10 @@ Exactly one of `--input` or `--phonemes` must be supplied.
 - `download_model.sh` – Convenience wrapper around `gdown` for the LJSpeech checkpoint.
 - `text_to_phonemes.py` – Uses `g2p_en` to map text to phoneme IDs aligned with the model config.
 - `verify_weights.py` – Compares two weight directories (or sanity-checks one) for mismatches.
-- `compare_runtime.py` – Runs the PyTorch checkpoint and C++ runtime on the same phoneme IDs and reports numerical differences.
-- `generate_op_test_data.py`, `extract_component_outputs.py`, `generate_integration_test_data.py` –
-  Helper scripts for creating golden data used by the C++ test harness.
+- `parity/compare_runtime.py` – Runs the PyTorch checkpoint and C++ runtime on the same phoneme IDs and reports numerical differences.
+- `parity/compare_dumps.py` – Diffs intermediate tensors emitted by PyTorch and the C++ runtime.
+- `parity/dump_pytorch_intermediates.py` – Materialises PyTorch-side intermediate tensors.
+- `golden/generate_op_test_data.py` – Helper used when regenerating golden data for the C++ tests.
 - `test_inference.py`, `test_checkpoint_load.py` – Lightweight smoke tests against PyTorch.
 
 > **Tip:** Tools live outside the runtime and expect the Python environment from
@@ -148,19 +153,18 @@ Exactly one of `--input` or `--phonemes` must be supplied.
 > mean the requirements are not installed.
 
 ## Validation & Testing
-- `make test-data` – Regenerates reference tensors from the PyTorch pipeline.
-- `make test-ops` – Builds and runs operator unit tests (requires generated data).
-- `make test-components` / `make test-integration` – Component and E2E comparisons.
-- `make parity-check` – Runs `tools/compare_runtime.py` against the C++ binary using the
-  sample LJSpeech checkpoint (override `CHECKPOINT`, `PREPROCESS_CFG`, `MODEL_CFG`,
-  `WEIGHTS_DIR`, or `PHONEMES` to customise).
-- `make debug` – Builds a symbol-enabled binary for stepping through layers.
+- `cmake --build build --target parity-check` – Runs `tools/parity/compare_runtime.py`
+  against the freshly built binary using the sample LJSpeech checkpoint.
+- `python3 tools/parity/compare_dumps.py ...` – Diff individual intermediate tensors after
+  generating dumps with the helper scripts.
+- `python3 tools/golden/generate_op_test_data.py` – Regenerate C++ fixture data when updating
+  checkpoints or operators.
 
 The current repository focuses on inference correctness. Operator/component test data
 must be generated from a matching checkpoint before the test binaries can succeed.
 
 ## Runtime Verification
-- `python3 tools/compare_runtime.py` – Compare mel-spectrograms produced by the PyTorch
+- `python3 tools/parity/compare_runtime.py` – Compare mel-spectrograms produced by the PyTorch
   checkpoint and the C++ binary for a shared phoneme sequence. The script reports maximum
   absolute/relative differences and exits non-zero if tolerances are exceeded.
 

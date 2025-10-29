@@ -16,7 +16,7 @@ Golden data is organized into three levels, matching the bottom-up testing strat
 
 **Purpose**: Validate basic operators in `op.cpp` against PyTorch implementations.
 
-**Script**: `tools/generate_op_test_data.py`
+**Script**: `tools/golden/generate_op_test_data.py`
 
 **Requirements**: PyTorch, NumPy (no trained model needed)
 
@@ -37,7 +37,7 @@ Golden data is organized into three levels, matching the bottom-up testing strat
 **Usage**:
 ```bash
 cd fastspeech2_cpp
-python3 tools/generate_op_test_data.py --output_dir test/data
+python3 tools/golden/generate_op_test_data.py --output_dir test/data
 ```
 
 **Output**: `test/data/` directory with `.bin` and `_meta.txt` files for each operator.
