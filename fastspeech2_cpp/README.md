@@ -1,322 +1,158 @@
 # FastSpeech2 C++ Inference Engine
 
-A lightweight, zero-dependency C++ implementation of FastSpeech2 for text-to-speech inference.
+A lightweight, dependency-free C++11 runtime for FastSpeech2 text-to-speech inference.  
+It mirrors the original PyTorch implementation (ming024/FastSpeech2) and ships with helper
+tools to convert checkpoints and prepare inputs.
 
-## Features
-
-- ✅ **Zero external dependencies** - Only standard C++11 library
-- ✅ **Complete implementation** - Encoder, Variance Adaptor, Decoder, PostNet
-- ✅ **Efficient inference** - Direct matrix operations, no overhead
-- ✅ **Simple CLI** - Easy-to-use command-line interface
-- ✅ **Portable** - Compiles on Linux, macOS, Windows
-
-## Architecture
-
-```
-Phoneme IDs → Encoder (4 layers) → Variance Adaptor → Length Regulation
-    → Decoder (6 layers) → Mel Linear → PostNet (5 layers) → Mel-Spectrogram
-```
-
-**Model Parameters**: ~26M parameters
-- **Encoder**: 4 FFT blocks (Multi-Head Attention + Feed-Forward)
-- **Variance Adaptor**: Duration/Pitch/Energy predictors + Length Regulator
-- **Decoder**: 6 FFT blocks
-- **PostNet**: 5 Conv1D layers with Batch Normalization
+## Directory Overview
+- `fastspeech2.cpp`, `op.cpp`, `fastspeech2.h`, `op.h` – core model implementation and math ops
+- `main.cpp` – CLI entry point
+- `Makefile` – build, debug, and test targets
+- `weights/` – binary weights produced by the conversion scripts
+- `tools/` – Python utilities (checkpoint conversion, phoneme conversion, sanity checks)
+- `requirements.txt` – Python dependencies needed by the tools
 
 ## Quick Start
+1. **Prepare the Python environment**
+   ```bash
+   cd fastspeech2_cpp
+   python3 -m venv .venv
+   source .venv/bin/activate         # On Windows: .venv\Scripts\activate
+   pip install -r requirements.txt   # Installs PyYAML, torch, gdown, g2p-en, etc.
+   ```
 
-### 0. Install Python Dependencies
+2. **Download the pretrained checkpoint**
+   ```bash
+   cd tools
+   ./download_model.sh               # Uses gdown to fetch LJSpeech 900000.pth.tar
+   cd ..
+   ```
+   The checkpoint ends up in `../output/ckpt/LJSpeech/900000.pth.tar`.
 
-**Using virtual environment (recommended):**
-```bash
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
+3. **Convert PyTorch weights to the C++ binary format**
+   ```bash
+   python3 tools/convert_weights.py \
+     --checkpoint ../output/ckpt/LJSpeech/900000.pth.tar \
+     --preprocess_config ../config/LJSpeech/preprocess.yaml \
+     --model_config ../config/LJSpeech/model.yaml \
+     --output_dir weights
+   ```
+   The converter reads the stats from the preprocessing directory, embeds the model
+   configuration, and produces the layout expected by the runtime (`weights/encoder/...`,
+   `weights/decoder/...`, `weights/config.bin`, etc.).
+
+4. **(Optional) Validate the converted weights**
+   ```bash
+   python3 tools/verify_weights.py \
+     --reference weights \
+     --candidate /path/to/fresh_conversion \
+     --tolerance 1e-5
+   ```
+   Omit `--candidate` to perform a quick NaN/Inf scan on a single directory.
+
+5. **(Optional) Compare C++ runtime with PyTorch output**
+   ```bash
+   python3 tools/compare_runtime.py \
+     --checkpoint ../output/ckpt/LJSpeech/900000.pth.tar \
+     --preprocess_config ../config/LJSpeech/preprocess.yaml \
+     --model_config ../config/LJSpeech/model.yaml \
+     --weights_dir weights \
+     --runtime ./fastspeech2 \
+     --phonemes "23,15,8,32,45,12"
+   ```
+   The script runs both implementations and reports the maximum absolute/relative
+   difference between their mel-spectrograms.
+
+6. **Build the C++ binary**
+   ```bash
+   make build        # Produces ./fastspeech2
+   ```
+
+7. **Run inference**
+   - With phoneme IDs in a file (comma or whitespace separated):
+     ```bash
+     ./fastspeech2 \
+       --config weights/config.bin \
+       --weights weights \
+       --input test_input.txt \
+       --output output_mel.bin
+     ```
+   - Passing phoneme IDs directly:
+     ```bash
+     ./fastspeech2 \
+       --config weights/config.bin \
+       --weights weights \
+       --phonemes "23, 15, 8, 32, 45, 12" \
+       --output output_mel.bin
+     ```
+   The binary prepends the mel shape `[frames, 80]` to the output file for easy inspection.
+
+   Need phonemes from raw text? Use:
+   ```bash
+   python3 tools/text_to_phonemes.py --text "Hello world" --output phonemes.txt
+   ```
+   then feed `phonemes.txt` into the CLI.
+
+## Command-line Reference
 ```
-
-**Key dependencies:**
-- PyTorch 2.0.1 (CPU-only)
-- NumPy, PyYAML
-- g2p-en (text-to-phonemes)
-- gdown (model download)
-
-See [INSTALL.md](INSTALL.md) for detailed installation instructions.
-
-### 1. Build
-
-```bash
-make build
-```
-
-### 2. Download Pretrained Model
-
-**Option 1: Automatic download (recommended)**
-```bash
-cd tools/
-./download_model.sh
-```
-
-The script will:
-- Automatically download the LJSpeech model (900000 steps) using `gdown`
-- Place `900000.pth.tar` in `../output/ckpt/LJSpeech/`
-- Verify the download and show next steps
-
-**Option 2: Manual download**
-1. Download from: https://drive.google.com/file/d/1r3fYhnblBJ8hDKDSUDtidJ-BN-xAM9pe/view
-2. Place `900000.pth.tar` in `../output/ckpt/LJSpeech/`
-
-**Note**: If you don't have `gdown` installed:
-```bash
-pip3 install gdown
-```
-
-### 3. Convert Weights
-
-Convert PyTorch weights to binary format:
-
-```bash
-python3 tools/convert_weights.py \
-    --checkpoint ../output/ckpt/LJSpeech/900000.pth.tar \
-    --preprocess_config ../config/LJSpeech/preprocess.yaml \
-    --model_config ../config/LJSpeech/model.yaml \
-    --output_dir weights/
-```
-
-This will create:
-```
-weights/
-├── config.bin
-├── encoder/
-│   ├── embedding.bin
-│   └── layer_*/
-├── variance_adaptor/
-│   ├── duration_predictor/
-│   ├── pitch_predictor/
-│   ├── energy_predictor/
-│   ├── pitch_embedding.bin
-│   └── energy_embedding.bin
-├── decoder/
-│   └── layer_*/
-├── mel_linear_weight.bin
-├── mel_linear_bias.bin
-└── postnet/
-    └── layer_*/
-```
-
-### 4. Run Inference
-
-```bash
-# Using phoneme IDs directly
-./fastspeech2 \
-    --config weights/config.bin \
-    --weights weights/ \
-    --phonemes "23,15,8,32,45,12" \
-    --output output.mel
-
-# Using phoneme ID file
-./fastspeech2 \
-    --config weights/config.bin \
-    --weights weights/ \
-    --input phonemes.txt \
-    --output output.mel
-```
-
-### 5. Convert Text to Phonemes
-
-```bash
-# Convert text to phoneme IDs
-python3 tools/text_to_phonemes.py \
-    --text "Hello world" \
-    --output phonemes.txt
-
-# The output will be saved as both .txt and .bin formats
-```
-
-## Project Structure
-
-```
-fastspeech2_cpp/
-├── main.cpp              # CLI interface (210 lines)
-├── fastspeech2.h         # Data structures (200 lines)
-├── fastspeech2.cpp       # Model implementation (750 lines)
-├── op.h                  # Operator declarations (80 lines)
-├── op.cpp                # Operator implementations (370 lines)
-├── Makefile              # Build system
-├── tools/
-│   ├── convert_weights.py          # PyTorch → Binary conversion
-│   ├── text_to_phonemes.py         # Text → Phoneme IDs
-│   ├── generate_op_test_data.py    # Test data generation
-│   ├── download_model.sh           # Model download helper
-│   └── README_GOLDEN_DATA.md       # Testing strategy
-└── test/
-    ├── test_ops.cpp                # Operator unit tests (TODO)
-    ├── test_components.cpp         # Component tests (TODO)
-    └── test_integration.cpp        # End-to-end tests (TODO)
-```
-
-**Total Lines of Code**: ~1,610 lines
-
-## Usage
-
-### Command Line Options
-
-```bash
 ./fastspeech2 [OPTIONS]
-
-Options:
-  --config <path>       Path to config.bin file (required)
-  --weights <dir>       Path to weights directory (required)
-  --input <path>        Path to input phoneme IDs file (.txt or .bin)
-  --phonemes <ids>      Phoneme IDs as comma-separated integers
-  --output <path>       Output mel-spectrogram file (.bin)
-  --help                Show help message
-
-Example:
-  ./fastspeech2 --config weights/config.bin --weights weights/ \
-                --phonemes "23,15,8,32,45,12" --output output.mel
+  --config <path>    Required. Path to weights/config.bin.
+  --weights <dir>    Required. Directory containing converted layer weights.
+  --input <path>     Optional. Text file (comma/space separated) or binary int32 phoneme IDs.
+  --phonemes <ids>   Optional. Inline comma-separated phoneme IDs.
+  --output <path>    Optional. Destination for the mel spectrogram (default: output_mel.bin).
+  --help             Print usage information.
 ```
+Exactly one of `--input` or `--phonemes` must be supplied.
 
-### Output Format
+## Python Tools
+- `convert_weights.py` – Torch-free checkpoint converter. Requires PyYAML, torch, and access
+  to the original preprocessing stats. Outputs the full binary weight tree.
+- `download_model.sh` – Convenience wrapper around `gdown` for the LJSpeech checkpoint.
+- `text_to_phonemes.py` – Uses `g2p_en` to map text to phoneme IDs aligned with the model config.
+- `verify_weights.py` – Compares two weight directories (or sanity-checks one) for mismatches.
+- `compare_runtime.py` – Runs the PyTorch checkpoint and C++ runtime on the same phoneme IDs and reports numerical differences.
+- `generate_op_test_data.py`, `extract_component_outputs.py`, `generate_integration_test_data.py` –
+  Helper scripts for creating golden data used by the C++ test harness.
+- `test_inference.py`, `test_checkpoint_load.py` – Lightweight smoke tests against PyTorch.
 
-The output mel-spectrogram is saved in binary format:
-- First 8 bytes: Shape (2 integers - [frames, n_mels])
-- Remaining bytes: Mel data (float32, row-major order)
+> **Tip:** Tools live outside the runtime and expect the Python environment from
+> `requirements.txt`. Missing modules (e.g., `ModuleNotFoundError: No module named 'yaml'`)
+> mean the requirements are not installed.
 
-## Implementation Details
+## Validation & Testing
+- `make test-data` – Regenerates reference tensors from the PyTorch pipeline.
+- `make test-ops` – Builds and runs operator unit tests (requires generated data).
+- `make test-components` / `make test-integration` – Component and E2E comparisons.
+- `make debug` – Builds a symbol-enabled binary for stepping through layers.
 
-### Operators (op.cpp)
+The current repository focuses on inference correctness. Operator/component test data
+must be generated from a matching checkpoint before the test binaries can succeed.
 
-- **Linear algebra**: `matmul`, `vec_add`, `vec_scale`
-- **Normalizations**: `layer_norm`, `batch_norm`
-- **Activations**: `gelu`, `relu`, `tanh`, `softmax`
-- **Attention**: `multi_head_attention` (scaled dot-product, 2 heads)
-- **Feed-forward**: `feed_forward` (2-layer with GELU)
-- **Convolution**: `conv1d` (with padding support)
-- **Positional encoding**: `sinusoidal_position_encoding`
-
-### Model Components (fastspeech2.cpp)
-
-1. **Encoder**: 4 FFT blocks with self-attention
-2. **Variance Adaptor**:
-   - Duration Predictor: Predicts phoneme durations
-   - Pitch Predictor: Predicts F0 values
-   - Energy Predictor: Predicts energy values
-   - Length Regulator: Expands phoneme-level to frame-level
-3. **Decoder**: 6 FFT blocks with self-attention
-4. **PostNet**: 5 Conv1D layers for mel refinement
-
-### Design Philosophy
-
-- **llama2.c-inspired**: Minimal, direct, readable code
-- **Zero dependencies**: Only standard C++11 library
-- **Correctness first**: Prioritize numerical accuracy over performance
-- **Simple structure**: 3 core files (main, model, ops)
-
-## Testing (TODO)
-
-### Operator Tests
-
-Generate test data:
-```bash
-python3 tools/generate_op_test_data.py --output_dir test/data
-```
-
-Run operator tests:
-```bash
-make test-ops
-```
-
-### Component Tests
-
-Extract PyTorch intermediate outputs:
-```bash
-python3 tools/extract_component_outputs.py \
-    --checkpoint ../output/ckpt/LJSpeech/900000.pth.tar \
-    --text "Hello world" \
-    --output_dir test/data/components
-```
-
-Run component tests:
-```bash
-make test-components
-```
-
-### Integration Tests
-
-Run end-to-end tests:
-```bash
-make test-integration
-```
-
-## Performance
-
-**Expected performance** (on modern CPU):
-- Inference time: < 100ms for 10-phoneme input
-- Memory usage: < 500MB
-- Real-time factor: ~10x faster than real-time
-
-**Note**: Current implementation prioritizes correctness. Performance optimizations will be added in future releases.
+## Runtime Verification
+- `python3 tools/compare_runtime.py` – Compare mel-spectrograms produced by the PyTorch
+  checkpoint and the C++ binary for a shared phoneme sequence. The script reports maximum
+  absolute/relative differences and exits non-zero if tolerances are exceeded.
 
 ## Troubleshooting
+- **Missing Python packages** – Activate your virtual environment and reinstall via
+  `pip install -r requirements.txt`. `PyYAML` and `g2p-en` are mandatory for the tools.
+- **Different checkpoint layout** – Rerun `convert_weights.py`; it embeds the conv kernel
+  sizes that the C++ runtime now consumes automatically.
+- **Unexpected durations or mel lengths** – Inspect the phoneme IDs passed to the CLI;
+  the loader accepts both comma and whitespace separated values after the latest update.
+- **Binary fails to open weights** – Confirm `weights/config.bin` and the directory tree
+  exist. Conversion must be run before building inference.
 
-### Issue: "Could not open config.bin"
-
-**Solution**: Convert weights first using `convert_weights.py`
-
-### Issue: "Could not open encoder/embedding.bin"
-
-**Solution**: Ensure weights directory structure matches the expected format. Re-run `convert_weights.py`.
-
-### Issue: "Warning: encoder/embedding.bin has X elements but expected Y"
-
-**Solution**: Check that the PyTorch model matches the expected architecture (vocab_size=76, dim=256, etc.)
-
-### Issue: Compilation errors
-
-**Solution**: Ensure you have g++ with C++11 support:
-```bash
-g++ --version  # Should be >= 4.8
-```
-
-## Current Status
-
-- ✅ Phase 1: Infrastructure complete
-- ✅ Phase 2: Core implementation complete
-- ⏳ Phase 3: Testing (operator tests pending)
-- ⏳ Phase 4: Component validation (needs trained model)
-- ⏳ Phase 5: Optimization & documentation
-
-## Limitations
-
-1. **Weight loading**: Requires converted binary weights (not GGUF format yet)
-2. **Testing**: Operator/component tests not yet implemented
-3. **Performance**: No SIMD/GPU optimization yet
-4. **Vocoder**: Mel-to-waveform conversion not included (use HiFi-GAN separately)
-
-## Future Work
-
-- [ ] Operator unit tests with PyTorch validation
-- [ ] Component-level tests
-- [ ] GGUF format support
-- [ ] SIMD optimization (AVX2, AVX-512)
-- [ ] Multi-threading support
-- [ ] Quantization (INT8/INT4)
-- [ ] Integrated vocoder (HiFi-GAN/MelGAN)
-
-## References
-
-- **Paper**: [FastSpeech 2: Fast and High-Quality End-to-End Text to Speech](https://arxiv.org/abs/2006.04558)
-- **PyTorch Implementation**: [ming024/FastSpeech2](https://github.com/ming024/FastSpeech2)
-- **Inspiration**: [karpathy/llama2.c](https://github.com/karpathy/llama2.c)
+## Implementation Notes
+- Encoder and decoder stacks each use the FFT blocks from FastSpeech2 (multi-head attention,
+  residual connections, and position-wise feed-forward layers).
+- Feed-forward modules are implemented as Conv1D layers (kernel sizes taken from the
+  converted weights) followed by GELU, matching the PyTorch architecture.
+- The variance adaptor implements duration, pitch, and energy predictors with shared
+  Conv1D + LayerNorm blocks, followed by a length regulator to produce mel frames.
+- PostNet adds five convolutional blocks with batch-norm refinement before writing
+  the mel spectrogram.
 
 ## License
-
-MIT License (same as original PyTorch implementation)
-
-## Contributing
-
-Contributions are welcome! Please see the [testing strategy](tools/README_GOLDEN_DATA.md) for guidelines.
-
----
-
-**Status**: Core implementation complete (Phase 2). Ready for testing and validation.
+MIT License — consistent with ming024/FastSpeech2.
