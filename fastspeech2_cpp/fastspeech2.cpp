@@ -210,19 +210,216 @@ void load_config(const char* config_path, Config* c) {
            c->dim, c->n_enc_layers, c->n_dec_layers);
 }
 
-void load_weights(const char* weights_path, Weights* w, Config* c) {
-    // This is a placeholder - actual implementation would load from binary files
-    // organized in the directory structure created by convert_weights.py
-    printf("Loading weights from %s...\n", weights_path);
+float* load_weight_file(const char* weights_dir, const char* rel_path, int expected_size) {
+    char full_path[512];
+    snprintf(full_path, sizeof(full_path), "%s/%s", weights_dir, rel_path);
 
-    // TODO: Implement actual weight loading from binary files
-    // This would involve reading files like:
-    // - encoder/embedding.bin
-    // - encoder/layer_0/attn_q_weight.bin
-    // - variance_adaptor/duration_predictor/conv1_weight.bin
-    // - etc.
+    FILE* f = fopen(full_path, "rb");
+    if (!f) {
+        fprintf(stderr, "Error: Could not open %s\n", full_path);
+        return nullptr;
+    }
 
-    fprintf(stderr, "Warning: Weight loading not yet implemented\n");
+    // Get file size
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    int n_elements = file_size / sizeof(float);
+    if (expected_size > 0 && n_elements != expected_size) {
+        fprintf(stderr, "Warning: %s has %d elements but expected %d\n",
+                rel_path, n_elements, expected_size);
+    }
+
+    float* data = new float[n_elements];
+    size_t read = fread(data, sizeof(float), n_elements, f);
+    fclose(f);
+
+    if (read != (size_t)n_elements) {
+        fprintf(stderr, "Error: Read %zu elements but expected %d from %s\n",
+                read, n_elements, rel_path);
+        delete[] data;
+        return nullptr;
+    }
+
+    return data;
+}
+
+void load_variance_predictor(const char* weights_dir, const char* vp_name,
+                             VariancePredictor* vp, Config* c) {
+    char path[256];
+    int dim = c->dim;
+    int filter_size = c->var_pred_filter_size;
+    int kernel_size = c->var_pred_kernel_size;
+
+    // Conv layers
+    snprintf(path, sizeof(path), "variance_adaptor/%s/conv1_weight.bin", vp_name);
+    vp->conv1_weight = load_weight_file(weights_dir, path, filter_size * dim * kernel_size);
+
+    snprintf(path, sizeof(path), "variance_adaptor/%s/conv1_bias.bin", vp_name);
+    vp->conv1_bias = load_weight_file(weights_dir, path, filter_size);
+
+    snprintf(path, sizeof(path), "variance_adaptor/%s/conv2_weight.bin", vp_name);
+    vp->conv2_weight = load_weight_file(weights_dir, path, filter_size * filter_size * kernel_size);
+
+    snprintf(path, sizeof(path), "variance_adaptor/%s/conv2_bias.bin", vp_name);
+    vp->conv2_bias = load_weight_file(weights_dir, path, filter_size);
+
+    // Layer norms
+    snprintf(path, sizeof(path), "variance_adaptor/%s/ln1_gamma.bin", vp_name);
+    vp->ln1_gamma = load_weight_file(weights_dir, path, filter_size);
+
+    snprintf(path, sizeof(path), "variance_adaptor/%s/ln1_beta.bin", vp_name);
+    vp->ln1_beta = load_weight_file(weights_dir, path, filter_size);
+
+    snprintf(path, sizeof(path), "variance_adaptor/%s/ln2_gamma.bin", vp_name);
+    vp->ln2_gamma = load_weight_file(weights_dir, path, filter_size);
+
+    snprintf(path, sizeof(path), "variance_adaptor/%s/ln2_beta.bin", vp_name);
+    vp->ln2_beta = load_weight_file(weights_dir, path, filter_size);
+
+    // Linear projection
+    snprintf(path, sizeof(path), "variance_adaptor/%s/linear_weight.bin", vp_name);
+    vp->linear_weight = load_weight_file(weights_dir, path, filter_size);
+
+    snprintf(path, sizeof(path), "variance_adaptor/%s/linear_bias.bin", vp_name);
+    vp->linear_bias = load_weight_file(weights_dir, path, 1);
+}
+
+void load_fft_layer(const char* weights_dir, const char* prefix, int layer_idx,
+                    FFTLayer* layer, Config* c) {
+    char path[256];
+    int dim = c->dim;
+    int ffn_hidden = c->ffn_hidden;
+
+    // Attention weights
+    snprintf(path, sizeof(path), "%s/layer_%d/attn_q_weight.bin", prefix, layer_idx);
+    layer->attn_q_weight = load_weight_file(weights_dir, path, dim * dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/attn_q_bias.bin", prefix, layer_idx);
+    layer->attn_q_bias = load_weight_file(weights_dir, path, dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/attn_k_weight.bin", prefix, layer_idx);
+    layer->attn_k_weight = load_weight_file(weights_dir, path, dim * dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/attn_k_bias.bin", prefix, layer_idx);
+    layer->attn_k_bias = load_weight_file(weights_dir, path, dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/attn_v_weight.bin", prefix, layer_idx);
+    layer->attn_v_weight = load_weight_file(weights_dir, path, dim * dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/attn_v_bias.bin", prefix, layer_idx);
+    layer->attn_v_bias = load_weight_file(weights_dir, path, dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/attn_out_weight.bin", prefix, layer_idx);
+    layer->attn_out_weight = load_weight_file(weights_dir, path, dim * dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/attn_out_bias.bin", prefix, layer_idx);
+    layer->attn_out_bias = load_weight_file(weights_dir, path, dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/attn_norm_gamma.bin", prefix, layer_idx);
+    layer->attn_norm_gamma = load_weight_file(weights_dir, path, dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/attn_norm_beta.bin", prefix, layer_idx);
+    layer->attn_norm_beta = load_weight_file(weights_dir, path, dim);
+
+    // Feed-forward weights
+    snprintf(path, sizeof(path), "%s/layer_%d/ffn_w1.bin", prefix, layer_idx);
+    layer->ffn_w1 = load_weight_file(weights_dir, path, dim * ffn_hidden);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/ffn_b1.bin", prefix, layer_idx);
+    layer->ffn_b1 = load_weight_file(weights_dir, path, ffn_hidden);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/ffn_w2.bin", prefix, layer_idx);
+    layer->ffn_w2 = load_weight_file(weights_dir, path, ffn_hidden * dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/ffn_b2.bin", prefix, layer_idx);
+    layer->ffn_b2 = load_weight_file(weights_dir, path, dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/ffn_norm_gamma.bin", prefix, layer_idx);
+    layer->ffn_norm_gamma = load_weight_file(weights_dir, path, dim);
+
+    snprintf(path, sizeof(path), "%s/layer_%d/ffn_norm_beta.bin", prefix, layer_idx);
+    layer->ffn_norm_beta = load_weight_file(weights_dir, path, dim);
+}
+
+void load_postnet_layer(const char* weights_dir, int layer_idx, PostNetLayer* layer,
+                       Config* c, int in_channels, int out_channels) {
+    char path[256];
+    int kernel_size = c->postnet_kernel_size;
+
+    snprintf(path, sizeof(path), "postnet/layer_%d/conv_weight.bin", layer_idx);
+    layer->conv_weight = load_weight_file(weights_dir, path, out_channels * in_channels * kernel_size);
+
+    snprintf(path, sizeof(path), "postnet/layer_%d/conv_bias.bin", layer_idx);
+    layer->conv_bias = load_weight_file(weights_dir, path, out_channels);
+
+    snprintf(path, sizeof(path), "postnet/layer_%d/bn_gamma.bin", layer_idx);
+    layer->bn_gamma = load_weight_file(weights_dir, path, out_channels);
+
+    snprintf(path, sizeof(path), "postnet/layer_%d/bn_beta.bin", layer_idx);
+    layer->bn_beta = load_weight_file(weights_dir, path, out_channels);
+
+    snprintf(path, sizeof(path), "postnet/layer_%d/bn_mean.bin", layer_idx);
+    layer->bn_mean = load_weight_file(weights_dir, path, out_channels);
+
+    snprintf(path, sizeof(path), "postnet/layer_%d/bn_var.bin", layer_idx);
+    layer->bn_var = load_weight_file(weights_dir, path, out_channels);
+}
+
+void load_weights(const char* weights_dir, Weights* w, Config* c) {
+    printf("Loading weights from %s...\n", weights_dir);
+
+    // Load encoder embedding
+    printf("  Loading encoder...\n");
+    w->encoder_embedding = load_weight_file(weights_dir, "encoder/embedding.bin",
+                                           c->vocab_size * c->dim);
+    if (!w->encoder_embedding) {
+        fprintf(stderr, "Failed to load encoder embedding\n");
+        return;
+    }
+
+    // Load encoder layers
+    for (int i = 0; i < c->n_enc_layers; i++) {
+        printf("    Layer %d...\n", i);
+        load_fft_layer(weights_dir, "encoder", i, &w->encoder_layers[i], c);
+    }
+
+    // Load variance adaptor
+    printf("  Loading variance adaptor...\n");
+    load_variance_predictor(weights_dir, "duration_predictor", &w->duration_predictor, c);
+    load_variance_predictor(weights_dir, "pitch_predictor", &w->pitch_predictor, c);
+    load_variance_predictor(weights_dir, "energy_predictor", &w->energy_predictor, c);
+
+    w->pitch_embedding = load_weight_file(weights_dir, "variance_adaptor/pitch_embedding.bin",
+                                         c->n_bins * c->dim);
+    w->energy_embedding = load_weight_file(weights_dir, "variance_adaptor/energy_embedding.bin",
+                                          c->n_bins * c->dim);
+
+    // Load decoder layers
+    printf("  Loading decoder...\n");
+    for (int i = 0; i < c->n_dec_layers; i++) {
+        printf("    Layer %d...\n", i);
+        load_fft_layer(weights_dir, "decoder", i, &w->decoder_layers[i], c);
+    }
+
+    // Load mel linear projection
+    printf("  Loading mel linear...\n");
+    w->mel_linear_weight = load_weight_file(weights_dir, "mel_linear_weight.bin",
+                                           c->dim * c->n_mels);
+    w->mel_linear_bias = load_weight_file(weights_dir, "mel_linear_bias.bin", c->n_mels);
+
+    // Load PostNet layers
+    printf("  Loading postnet...\n");
+    int postnet_dim = c->postnet_embedding_dim;
+    load_postnet_layer(weights_dir, 0, &w->postnet_layers[0], c, c->n_mels, postnet_dim);
+    for (int i = 1; i < c->postnet_n_convolutions - 1; i++) {
+        load_postnet_layer(weights_dir, i, &w->postnet_layers[i], c, postnet_dim, postnet_dim);
+    }
+    load_postnet_layer(weights_dir, c->postnet_n_convolutions - 1,
+                      &w->postnet_layers[c->postnet_n_convolutions - 1], c, postnet_dim, c->n_mels);
+
+    printf("✓ Weights loaded successfully!\n");
 }
 
 // ============================================================================
