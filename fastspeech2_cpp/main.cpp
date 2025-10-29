@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <vector>
 
@@ -36,8 +37,17 @@ std::vector<int> load_phoneme_ids_from_text(const char* path) {
         return ids;
     }
 
+    std::string contents((std::istreambuf_iterator<char>(file)),
+                         std::istreambuf_iterator<char>());
+    for (char& ch : contents) {
+        if (ch == ',' || ch == ';') {
+            ch = ' ';
+        }
+    }
+
+    std::stringstream ss(contents);
     int id;
-    while (file >> id) {
+    while (ss >> id) {
         ids.push_back(id);
     }
 
