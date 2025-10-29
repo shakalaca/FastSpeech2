@@ -137,6 +137,7 @@ Weights* create_weights(Config* c) {
 }
 
 void free_weights(Weights* w, Config* c) {
+    (void)c;
     // Free encoder
     delete[] w->encoder_embedding;
     delete[] w->encoder_pe;
@@ -210,7 +211,8 @@ void load_config(const char* config_path, Config* c) {
            c->dim, c->n_enc_layers, c->n_dec_layers);
 }
 
-float* load_weight_file(const char* weights_dir, const char* rel_path, int expected_size) {
+float* load_weight_file(const char* weights_dir, const char* rel_path, int expected_size,
+                        int* actual_size = nullptr) {
     char full_path[512];
     snprintf(full_path, sizeof(full_path), "%s/%s", weights_dir, rel_path);
 
@@ -226,6 +228,10 @@ float* load_weight_file(const char* weights_dir, const char* rel_path, int expec
     fseek(f, 0, SEEK_SET);
 
     int n_elements = file_size / sizeof(float);
+    if (actual_size) {
+        *actual_size = n_elements;
+    }
+
     if (expected_size > 0 && n_elements != expected_size) {
         fprintf(stderr, "Warning: %s has %d elements but expected %d\n",
                 rel_path, n_elements, expected_size);
@@ -291,6 +297,8 @@ void load_fft_layer(const char* weights_dir, const char* prefix, int layer_idx,
     char path[256];
     int dim = c->dim;
     int ffn_hidden = c->ffn_hidden;
+    layer->ffn_kernel_size1 = 1;
+    layer->ffn_kernel_size2 = 1;
 
     // Attention weights
     snprintf(path, sizeof(path), "%s/layer_%d/attn_q_weight.bin", prefix, layer_idx);
@@ -325,13 +333,35 @@ void load_fft_layer(const char* weights_dir, const char* prefix, int layer_idx,
 
     // Feed-forward weights
     snprintf(path, sizeof(path), "%s/layer_%d/ffn_w1.bin", prefix, layer_idx);
-    layer->ffn_w1 = load_weight_file(weights_dir, path, dim * ffn_hidden);
+    int ffn_w1_size = 0;
+    layer->ffn_w1 = load_weight_file(weights_dir, path, 0, &ffn_w1_size);
+    if (layer->ffn_w1 && ffn_w1_size > 0) {
+        int expected_base = dim * ffn_hidden;
+        if (ffn_w1_size % expected_base != 0) {
+            fprintf(stderr,
+                    "Error: %s has %d elements which is incompatible with dim=%d and ffn_hidden=%d\n",
+                    path, ffn_w1_size, dim, ffn_hidden);
+            exit(1);
+        }
+        layer->ffn_kernel_size1 = ffn_w1_size / expected_base;
+    }
 
     snprintf(path, sizeof(path), "%s/layer_%d/ffn_b1.bin", prefix, layer_idx);
     layer->ffn_b1 = load_weight_file(weights_dir, path, ffn_hidden);
 
     snprintf(path, sizeof(path), "%s/layer_%d/ffn_w2.bin", prefix, layer_idx);
-    layer->ffn_w2 = load_weight_file(weights_dir, path, ffn_hidden * dim);
+    int ffn_w2_size = 0;
+    layer->ffn_w2 = load_weight_file(weights_dir, path, 0, &ffn_w2_size);
+    if (layer->ffn_w2 && ffn_w2_size > 0) {
+        int expected_base = ffn_hidden * dim;
+        if (ffn_w2_size % expected_base != 0) {
+            fprintf(stderr,
+                    "Error: %s has %d elements which is incompatible with dim=%d and ffn_hidden=%d\n",
+                    path, ffn_w2_size, dim, ffn_hidden);
+            exit(1);
+        }
+        layer->ffn_kernel_size2 = ffn_w2_size / expected_base;
+    }
 
     snprintf(path, sizeof(path), "%s/layer_%d/ffn_b2.bin", prefix, layer_idx);
     layer->ffn_b2 = load_weight_file(weights_dir, path, dim);

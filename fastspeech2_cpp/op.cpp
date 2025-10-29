@@ -231,32 +231,19 @@ void multi_head_attention(RunState* s, Config* c, FFTLayer* layer,
 // ============================================================================
 
 void feed_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len) {
-    // Two-layer feed-forward network with GELU activation
+    // Two-layer position-wise feed-forward network implemented as conv1d ops.
     int dim = c->dim;
     int ffn_hidden = c->ffn_hidden;
+    int k1 = layer->ffn_kernel_size1 > 0 ? layer->ffn_kernel_size1 : 1;
+    int k2 = layer->ffn_kernel_size2 > 0 ? layer->ffn_kernel_size2 : 1;
+    int pad1 = k1 / 2;
+    int pad2 = k2 / 2;
 
-    // First linear layer: [seq_len, dim] -> [seq_len, ffn_hidden]
-    matmul(s->ffn_hidden, x, layer->ffn_w1, seq_len, dim, ffn_hidden);
-
-    // Add bias
-    for (int i = 0; i < seq_len; i++) {
-        for (int j = 0; j < ffn_hidden; j++) {
-            s->ffn_hidden[i * ffn_hidden + j] += layer->ffn_b1[j];
-        }
-    }
-
-    // GELU activation
+    conv1d(s->ffn_hidden, x, layer->ffn_w1, layer->ffn_b1,
+           1, dim, ffn_hidden, seq_len, k1, pad1);
     gelu(s->ffn_hidden, seq_len * ffn_hidden);
-
-    // Second linear layer: [seq_len, ffn_hidden] -> [seq_len, dim]
-    matmul(s->ffn_out, s->ffn_hidden, layer->ffn_w2, seq_len, ffn_hidden, dim);
-
-    // Add bias
-    for (int i = 0; i < seq_len; i++) {
-        for (int j = 0; j < dim; j++) {
-            s->ffn_out[i * dim + j] += layer->ffn_b2[j];
-        }
-    }
+    conv1d(s->ffn_out, s->ffn_hidden, layer->ffn_w2, layer->ffn_b2,
+           1, ffn_hidden, dim, seq_len, k2, pad2);
 }
 
 // ============================================================================
@@ -266,36 +253,31 @@ void feed_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len
 void conv1d(float* out, float* in, float* weight, float* bias,
            int batch, int in_channels, int out_channels, int seq_len,
            int kernel_size, int padding) {
-    // 1D convolution
-    // in: [batch, in_channels, seq_len]
+    // 1D convolution using [batch, seq_len, channels] memory layout.
     // weight: [out_channels, in_channels, kernel_size]
-    // out: [batch, out_channels, seq_len]
+    // out: [batch, seq_len, out_channels]
 
     for (int b = 0; b < batch; b++) {
-        for (int oc = 0; oc < out_channels; oc++) {
-            for (int t = 0; t < seq_len; t++) {
-                float sum = 0.0f;
+        float* in_batch = in + b * seq_len * in_channels;
+        float* out_batch = out + b * seq_len * out_channels;
 
-                // Convolve over input channels and kernel
+        for (int t = 0; t < seq_len; t++) {
+            for (int oc = 0; oc < out_channels; oc++) {
+                float sum = bias ? bias[oc] : 0.0f;
+
                 for (int ic = 0; ic < in_channels; ic++) {
                     for (int k = 0; k < kernel_size; k++) {
                         int in_pos = t + k - padding;
-
-                        // Handle padding (zero padding)
-                        if (in_pos >= 0 && in_pos < seq_len) {
-                            int in_idx = b * in_channels * seq_len + ic * seq_len + in_pos;
-                            int weight_idx = oc * in_channels * kernel_size + ic * kernel_size + k;
-                            sum += in[in_idx] * weight[weight_idx];
+                        if (in_pos < 0 || in_pos >= seq_len) {
+                            continue;
                         }
+                        int in_idx = in_pos * in_channels + ic;
+                        int weight_idx = oc * in_channels * kernel_size + ic * kernel_size + k;
+                        sum += in_batch[in_idx] * weight[weight_idx];
                     }
                 }
 
-                // Add bias
-                sum += bias[oc];
-
-                // Store output
-                int out_idx = b * out_channels * seq_len + oc * seq_len + t;
-                out[out_idx] = sum;
+                out_batch[t * out_channels + oc] = sum;
             }
         }
     }

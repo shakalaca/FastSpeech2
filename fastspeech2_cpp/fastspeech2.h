@@ -73,12 +73,14 @@ typedef struct {
     float* attn_norm_beta;      // [dim]
 
     // Position-wise Feed-Forward
-    float* ffn_w1;              // [dim, ffn_hidden]
+    float* ffn_w1;              // [ffn_hidden, dim, kernel]
     float* ffn_b1;              // [ffn_hidden]
-    float* ffn_w2;              // [ffn_hidden, dim]
+    float* ffn_w2;              // [dim, ffn_hidden, kernel]
     float* ffn_b2;              // [dim]
     float* ffn_norm_gamma;      // [dim]
     float* ffn_norm_beta;       // [dim]
+    int ffn_kernel_size1;       // kernel size for first FFN conv
+    int ffn_kernel_size2;       // kernel size for second FFN conv
 } FFTLayer;
 
 // PostNet layer structure
