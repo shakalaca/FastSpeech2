@@ -5,6 +5,7 @@
 
 // Basic linear algebra operations
 void matmul(float* C, float* A, float* B, int M, int K, int N);
+void matmul_transposed(float* C, float* A, float* B, int M, int K, int N);
 void vec_add(float* out, float* a, float* b, int n);
 void vec_scale(float* out, float* x, float scale, int n);
 

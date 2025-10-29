@@ -11,7 +11,7 @@ from typing import Dict, Tuple
 import numpy as np
 
 
-FLOAT_KEYS = [
+BASE_FLOAT_KEYS = [
     "encoder_embedding",
     "encoder_output",
     "variance_output",
@@ -66,7 +66,16 @@ def compare_directory(pytorch_dir: Path, cpp_dir: Path, abs_tol: float, rel_tol:
     status = 0
 
     print("=== Comparing float tensors ===")
-    for key in FLOAT_KEYS:
+    float_keys = list(BASE_FLOAT_KEYS)
+    # Collect per-layer encoder dumps if present
+    layer_idx = 0
+    while (pytorch_dir / f"encoder_layer_{layer_idx}.npy").exists() and (
+        cpp_dir / f"encoder_layer_{layer_idx}.bin"
+    ).exists():
+        float_keys.insert(1 + layer_idx, f"encoder_layer_{layer_idx}")
+        layer_idx += 1
+
+    for key in float_keys:
         pt = load_pytorch_dump(pytorch_dir, key)
         if pt.ndim > 1 and pt.shape[0] == 1:
             pt = np.squeeze(pt, axis=0)

@@ -153,8 +153,17 @@ def dump_intermediates(
             ].expand(ids.size(0), -1, -1)
             write_tensor(output_dir / "encoder_embedding.npy", embedding)
 
-            # 2. Encoder output
-            encoder_output = model.encoder(ids, src_masks)
+            # Manually iterate through encoder layers to capture per-layer outputs
+            slf_attn_mask = src_masks.unsqueeze(1).expand(-1, max_src_len, -1)
+            encoder_output = embedding.clone()
+            for layer_idx, enc_layer in enumerate(model.encoder.layer_stack):
+                encoder_output, _ = enc_layer(
+                    encoder_output, mask=src_masks, slf_attn_mask=slf_attn_mask
+                )
+                write_tensor(
+                    output_dir / f"encoder_layer_{layer_idx}.npy",
+                    encoder_output,
+                )
             write_tensor(output_dir / "encoder_output.npy", encoder_output)
 
             # Add speaker embedding if multi speaker

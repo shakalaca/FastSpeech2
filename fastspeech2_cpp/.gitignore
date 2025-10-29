@@ -16,6 +16,8 @@ debug/*.txt
 # Test data (too large to commit)
 test/data/*.bin
 test/data/*.txt
+test_data/cpp_dump/
+test_data/py_ref/
 
 # Converted weights (too large to commit)
 weights/
@@ -23,3 +25,4 @@ weights/
 # Output files
 *.mel
 output*.bin
+

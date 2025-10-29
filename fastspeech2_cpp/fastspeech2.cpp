@@ -599,6 +599,12 @@ void encoder_forward(RunState* s, Config* c, Weights* w, int* phoneme_ids, int n
     float* x = s->encoder_emb;
     for (int layer = 0; layer < c->n_enc_layers; layer++) {
         encoder_layer_forward(s, c, &w->encoder_layers[layer], x, n_phonemes);
+        if (dump_enabled()) {
+            char filename[64];
+            snprintf(filename, sizeof(filename), "encoder_layer_%d.bin", layer);
+            printf("Dumping %s\n", filename);
+            dump_float_matrix(filename, s->attn_out, n_phonemes, c->dim);
+        }
         x = s->attn_out;  // Output becomes input to next layer
     }
 
@@ -770,7 +776,7 @@ void decoder_forward(RunState* s, Config* c, Weights* w, int mel_len) {
     }
 
     // 4. Project to mel-spectrogram: [mel_len, dim] -> [mel_len, n_mels]
-    matmul(s->mel_out, s->decoder_out, w->mel_linear_weight, mel_len, c->dim, c->n_mels);
+    matmul_transposed(s->mel_out, s->decoder_out, w->mel_linear_weight, mel_len, c->dim, c->n_mels);
 
     // Add bias
     for (int i = 0; i < mel_len; i++) {

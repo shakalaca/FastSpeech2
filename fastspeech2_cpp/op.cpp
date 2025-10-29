@@ -20,6 +20,19 @@ void matmul(float* C, float* A, float* B, int M, int K, int N) {
     }
 }
 
+void matmul_transposed(float* C, float* A, float* B, int M, int K, int N) {
+    // C[M, N] = A[M, K] @ B^T, where B is stored as [N, K]
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) {
+                sum += A[i * K + k] * B[j * K + k];
+            }
+            C[i * N + j] = sum;
+        }
+    }
+}
+
 void vec_add(float* out, float* a, float* b, int n) {
     // out = a + b (element-wise)
     for (int i = 0; i < n; i++) {
@@ -154,9 +167,9 @@ void multi_head_attention(RunState* s, Config* c, FFTLayer* layer,
     int head_dim = c->head_dim;
 
     // Linear projections: Q, K, V
-    matmul(s->attn_q, q_input, layer->attn_q_weight, q_len, dim, dim);
-    matmul(s->attn_k, k_input, layer->attn_k_weight, kv_len, dim, dim);
-    matmul(s->attn_v, v_input, layer->attn_v_weight, kv_len, dim, dim);
+    matmul_transposed(s->attn_q, q_input, layer->attn_q_weight, q_len, dim, dim);
+    matmul_transposed(s->attn_k, k_input, layer->attn_k_weight, kv_len, dim, dim);
+    matmul_transposed(s->attn_v, v_input, layer->attn_v_weight, kv_len, dim, dim);
 
     // Add bias
     for (int i = 0; i < q_len; i++) {
@@ -216,7 +229,7 @@ void multi_head_attention(RunState* s, Config* c, FFTLayer* layer,
     // Output projection
     float* temp = s->ffn_out;  // Reuse buffer
     memcpy(temp, s->attn_out, q_len * dim * sizeof(float));
-    matmul(s->attn_out, temp, layer->attn_out_weight, q_len, dim, dim);
+    matmul_transposed(s->attn_out, temp, layer->attn_out_weight, q_len, dim, dim);
 
     // Add bias
     for (int i = 0; i < q_len; i++) {
