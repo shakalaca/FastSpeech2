@@ -22,6 +22,7 @@ void print_usage(const char* program_name) {
     printf("  --input <path>        Path to input phoneme IDs file (.txt or .bin)\n");
     printf("  --phonemes <ids>      Phoneme IDs as comma-separated integers\n");
     printf("  --output <path>       Output mel-spectrogram file (.bin)\n");
+    printf("  --dump_dir <path>     Optional directory to dump intermediate tensors\n");
     printf("  --help                Show this help message\n");
     printf("\nExample:\n");
     printf("  %s --config weights/config.bin --weights weights/ \\\n", program_name);
@@ -136,6 +137,7 @@ int main(int argc, char* argv[]) {
     const char* input_path = nullptr;
     const char* phoneme_str = nullptr;
     const char* output_path = "output_mel.bin";
+    const char* dump_dir = nullptr;
 
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
@@ -152,6 +154,8 @@ int main(int argc, char* argv[]) {
             phoneme_str = argv[++i];
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             output_path = argv[++i];
+        } else if (strcmp(argv[i], "--dump_dir") == 0 && i + 1 < argc) {
+            dump_dir = argv[++i];
         } else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -187,6 +191,12 @@ int main(int argc, char* argv[]) {
     Config config;
     load_config(config_path, &config);
     printf("\n");
+
+    if (dump_dir) {
+        set_dump_directory(dump_dir);
+    } else {
+        set_dump_directory(nullptr);
+    }
 
     // Create weights and load
     printf("2. Loading model weights...\n");

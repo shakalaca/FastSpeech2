@@ -4,6 +4,89 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <string>
+#include <vector>
+#include <cerrno>
+#include <sys/types.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
+
+typedef struct {
+    bool enabled;
+    std::string dir;
+} DumpContext;
+
+static DumpContext g_dump_ctx = {false, ""};
+
+static bool dump_enabled() {
+    return g_dump_ctx.enabled;
+}
+
+static void ensure_dump_dir() {
+    if (!g_dump_ctx.enabled || g_dump_ctx.dir.empty()) return;
+#ifdef _WIN32
+    _mkdir(g_dump_ctx.dir.c_str());
+#else
+    if (mkdir(g_dump_ctx.dir.c_str(), 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "Warning: could not create dump directory %s\n", g_dump_ctx.dir.c_str());
+    }
+#endif
+}
+
+static std::string make_dump_path(const char* name) {
+    std::string path = g_dump_ctx.dir;
+    if (!path.empty() && path.back() != '/' && path.back() != '\\') {
+        path += "/";
+    }
+    path += name;
+    return path;
+}
+
+static void dump_float_matrix(const char* name, const float* data, int rows, int cols) {
+    if (!dump_enabled()) return;
+    std::string path = make_dump_path(name);
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "Warning: could not open %s for dumping\n", path.c_str());
+        return;
+    }
+    fwrite(&rows, sizeof(int), 1, f);
+    fwrite(&cols, sizeof(int), 1, f);
+    fwrite(data, sizeof(float), (size_t)rows * cols, f);
+    fclose(f);
+}
+
+static void dump_float_vector(const char* name, const float* data, int length) {
+    dump_float_matrix(name, data, length, 1);
+}
+
+static void dump_int_vector(const char* name, const int* data, int length) {
+    if (!dump_enabled()) return;
+    std::string path = make_dump_path(name);
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "Warning: could not open %s for dumping\n", path.c_str());
+        return;
+    }
+    fwrite(&length, sizeof(int), 1, f);
+    int cols = 1;
+    fwrite(&cols, sizeof(int), 1, f);
+    fwrite(data, sizeof(int), (size_t)length, f);
+    fclose(f);
+}
+
+void set_dump_directory(const char* path) {
+    if (path && path[0] != '\0') {
+        g_dump_ctx.enabled = true;
+        g_dump_ctx.dir = path;
+        ensure_dump_dir();
+    } else {
+        g_dump_ctx.enabled = false;
+        g_dump_ctx.dir.clear();
+    }
+}
 
 // ============================================================================
 // Initialization and Cleanup Functions
@@ -508,6 +591,10 @@ void encoder_forward(RunState* s, Config* c, Weights* w, int* phoneme_ids, int n
         }
     }
 
+    if (dump_enabled()) {
+        dump_float_matrix("encoder_embedding.bin", s->encoder_emb, n_phonemes, c->dim);
+    }
+
     // 3. Pass through encoder layers
     float* x = s->encoder_emb;
     for (int layer = 0; layer < c->n_enc_layers; layer++) {
@@ -517,6 +604,10 @@ void encoder_forward(RunState* s, Config* c, Weights* w, int* phoneme_ids, int n
 
     // 4. Copy final output to encoder_out
     memcpy(s->encoder_out, s->attn_out, n_phonemes * c->dim * sizeof(float));
+
+    if (dump_enabled()) {
+        dump_float_matrix("encoder_output.bin", s->encoder_out, n_phonemes, c->dim);
+    }
 }
 
 // ============================================================================
@@ -571,6 +662,13 @@ void variance_adaptor_forward(RunState* s, Config* c, Weights* w, int n_phonemes
     variance_predictor_forward(s, c, &w->pitch_predictor, s->encoder_out, n_phonemes, s->pitch_pred);
     variance_predictor_forward(s, c, &w->energy_predictor, s->encoder_out, n_phonemes, s->energy_pred);
 
+    std::vector<float> log_duration_values;
+    if (dump_enabled()) {
+        dump_float_vector("pitch_prediction.bin", s->pitch_pred, n_phonemes);
+        dump_float_vector("energy_prediction.bin", s->energy_pred, n_phonemes);
+        log_duration_values.assign(s->duration_pred, s->duration_pred + n_phonemes);
+    }
+
     // 2. Quantize and embed pitch/energy (phoneme-level)
     for (int i = 0; i < n_phonemes; i++) {
         // Quantize predictions to bin indices
@@ -587,9 +685,18 @@ void variance_adaptor_forward(RunState* s, Config* c, Weights* w, int n_phonemes
     // 3. Length Regulation - expand phoneme sequence to mel frames
     s->mel_len = 0;
     for (int i = 0; i < n_phonemes; i++) {
-        // Round duration prediction
-        s->durations[i] = (int)(s->duration_pred[i] + 0.5f);
-        if (s->durations[i] < 1) s->durations[i] = 1;  // Minimum duration is 1
+        // Duration predictor outputs log(duration + 1)
+        float duration = expf(s->duration_pred[i]) - 1.0f;
+        if (duration < 0.0f) duration = 0.0f;
+
+        s->duration_pred[i] = duration;
+
+        // Round to nearest integer number of frames
+        int rounded = (int)lrintf(duration);
+        if (rounded < 0) {
+            rounded = 0;
+        }
+        s->durations[i] = rounded;
 
         // Repeat phoneme representation duration[i] times
         for (int d = 0; d < s->durations[i]; d++) {
@@ -598,6 +705,37 @@ void variance_adaptor_forward(RunState* s, Config* c, Weights* w, int n_phonemes
                    c->dim * sizeof(float));
             s->mel_len++;
         }
+    }
+
+    if (s->mel_len == 0) {
+        // Ensure at least one frame to avoid downstream issues
+        memcpy(s->variance_out, s->encoder_out, c->dim * sizeof(float));
+        s->mel_len = 1;
+    }
+
+    const char* debug_env = getenv("FS2_DEBUG_DURATIONS");
+    if (debug_env) {
+        printf("  Durations (rounded): [");
+        for (int i = 0; i < n_phonemes; i++) {
+            printf("%d", s->durations[i]);
+            if (i != n_phonemes - 1) printf(", ");
+        }
+        printf("]\n");
+        printf("  Durations (float): [");
+        for (int i = 0; i < n_phonemes; i++) {
+            printf("%.4f", s->duration_pred[i]);
+            if (i != n_phonemes - 1) printf(", ");
+        }
+        printf("]\n");
+    }
+
+    if (dump_enabled()) {
+        if (!log_duration_values.empty()) {
+            dump_float_vector("log_duration_prediction.bin", log_duration_values.data(), n_phonemes);
+        }
+        dump_float_vector("duration_prediction.bin", s->duration_pred, n_phonemes);
+        dump_int_vector("duration_rounded.bin", s->durations, n_phonemes);
+        dump_float_matrix("variance_output.bin", s->variance_out, s->mel_len, c->dim);
     }
 }
 
@@ -627,6 +765,9 @@ void decoder_forward(RunState* s, Config* c, Weights* w, int mel_len) {
 
     // 3. Copy final output to decoder_out
     memcpy(s->decoder_out, s->attn_out, mel_len * c->dim * sizeof(float));
+    if (dump_enabled()) {
+        dump_float_matrix("decoder_output.bin", s->decoder_out, mel_len, c->dim);
+    }
 
     // 4. Project to mel-spectrogram: [mel_len, dim] -> [mel_len, n_mels]
     matmul(s->mel_out, s->decoder_out, w->mel_linear_weight, mel_len, c->dim, c->n_mels);
@@ -636,6 +777,10 @@ void decoder_forward(RunState* s, Config* c, Weights* w, int mel_len) {
         for (int j = 0; j < c->n_mels; j++) {
             s->mel_out[i * c->n_mels + j] += w->mel_linear_bias[j];
         }
+    }
+
+    if (dump_enabled()) {
+        dump_float_matrix("mel_before.bin", s->mel_out, mel_len, c->n_mels);
     }
 }
 
@@ -695,6 +840,10 @@ void postnet_forward(RunState* s, Config* c, Weights* w, int mel_len) {
     // Add residual connection: postnet_out = mel_out + postnet_output
     for (int i = 0; i < mel_len * c->n_mels; i++) {
         s->postnet_mel_out[i] = s->mel_out[i] + temp_out[i];
+    }
+
+    if (dump_enabled()) {
+        dump_float_matrix("mel_after.bin", s->postnet_mel_out, mel_len, c->n_mels);
     }
 }
 

@@ -187,4 +187,7 @@ void fastspeech2_forward(RunState* s, Config* c, Weights* w,
 // Utilities
 int quantize_value(float value, float min_val, float max_val, int n_bins);
 
+// Debug / dumping helpers
+void set_dump_directory(const char* path);
+
 #endif // FASTSPEECH2_H
