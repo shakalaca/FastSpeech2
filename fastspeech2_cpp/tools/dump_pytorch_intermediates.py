@@ -30,6 +30,7 @@ from typing import Iterable, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 
 
@@ -153,24 +154,63 @@ def dump_intermediates(
             ].expand(ids.size(0), -1, -1)
             write_tensor(output_dir / "encoder_embedding.npy", embedding)
 
-            # Manually iterate through encoder layers to capture per-layer outputs
-            slf_attn_mask = src_masks.unsqueeze(1).expand(-1, max_src_len, -1)
-            encoder_output = embedding.clone()
-            for layer_idx, enc_layer in enumerate(model.encoder.layer_stack):
-                encoder_output, _ = enc_layer(
-                    encoder_output, mask=src_masks, slf_attn_mask=slf_attn_mask
-                )
-                write_tensor(
-                    output_dir / f"encoder_layer_{layer_idx}.npy",
-                    encoder_output,
-                )
-            write_tensor(output_dir / "encoder_output.npy", encoder_output)
-
-            # Add speaker embedding if multi speaker
+            current = embedding.clone()
             if model.speaker_emb is not None:
                 speaker = torch.LongTensor([speaker_id]).to(device)
-                encoder_output = encoder_output + model.speaker_emb(speaker).unsqueeze(1)
-            write_tensor(output_dir / "encoder_output_with_speaker.npy", encoder_output)
+                current = current + model.speaker_emb(speaker).unsqueeze(1)
+            write_tensor(output_dir / "encoder_output_with_speaker.npy", current)
+
+            slf_attn_mask = src_masks.unsqueeze(1).expand(-1, max_src_len, -1)
+            for layer_idx, enc_layer in enumerate(model.encoder.layer_stack):
+                prefix = output_dir / f"encoder_layer_{layer_idx}"
+
+                q_linear = F.linear(current, enc_layer.slf_attn.w_qs.weight, enc_layer.slf_attn.w_qs.bias)
+                k_linear = F.linear(current, enc_layer.slf_attn.w_ks.weight, enc_layer.slf_attn.w_ks.bias)
+                v_linear = F.linear(current, enc_layer.slf_attn.w_vs.weight, enc_layer.slf_attn.w_vs.bias)
+                write_tensor(prefix.with_name(prefix.name + "_attn_q.npy"), q_linear)
+                write_tensor(prefix.with_name(prefix.name + "_attn_k.npy"), k_linear)
+                write_tensor(prefix.with_name(prefix.name + "_attn_v.npy"), v_linear)
+
+                n_head = enc_layer.slf_attn.n_head
+                d_k = enc_layer.slf_attn.d_k
+                d_v = enc_layer.slf_attn.d_v
+
+                q = q_linear.view(1, -1, n_head, d_k).permute(0, 2, 1, 3).contiguous().view(-1, q_linear.size(1), d_k)
+                k = k_linear.view(1, -1, n_head, d_k).permute(0, 2, 1, 3).contiguous().view(-1, k_linear.size(1), d_k)
+                v = v_linear.view(1, -1, n_head, d_v).permute(0, 2, 1, 3).contiguous().view(-1, v_linear.size(1), d_v)
+
+                attn_mask = slf_attn_mask.repeat(n_head, 1, 1)
+                scores = torch.matmul(q, k.transpose(1, 2)) / (d_k ** 0.5)
+                scores = scores.masked_fill(attn_mask, float('-inf'))
+                attn_weights = torch.softmax(scores, dim=-1)
+                context = torch.matmul(attn_weights, v)
+                context = context.view(n_head, 1, q_linear.size(1), d_v).permute(1, 2, 0, 3).contiguous().view(1, q_linear.size(1), -1)
+
+                attn_out = F.linear(context, enc_layer.slf_attn.fc.weight, enc_layer.slf_attn.fc.bias)
+                attn_out = enc_layer.slf_attn.dropout(attn_out)
+                write_tensor(prefix.with_name(prefix.name + "_attn_out.npy"), attn_out)
+
+                attn_residual = attn_out + current
+                write_tensor(prefix.with_name(prefix.name + "_attn_residual.npy"), attn_residual)
+
+                attn_norm = enc_layer.slf_attn.layer_norm(attn_residual)
+                write_tensor(prefix.with_name(prefix.name + "_attn_norm.npy"), attn_norm)
+
+                ffn_pre = enc_layer.pos_ffn.w_1(attn_norm.transpose(1, 2)).transpose(1, 2)
+                write_tensor(prefix.with_name(prefix.name + "_ffn_pre_relu.npy"), ffn_pre)
+                ffn_post = torch.relu(ffn_pre)
+                write_tensor(prefix.with_name(prefix.name + "_ffn_post_relu.npy"), ffn_post)
+                ffn_out = enc_layer.pos_ffn.w_2(ffn_post.transpose(1, 2)).transpose(1, 2)
+                ffn_out = enc_layer.pos_ffn.dropout(ffn_out)
+                write_tensor(prefix.with_name(prefix.name + "_ffn_out.npy"), ffn_out)
+                ffn_residual = ffn_out + attn_norm
+                write_tensor(prefix.with_name(prefix.name + "_ffn_residual.npy"), ffn_residual)
+
+                current = enc_layer.pos_ffn.layer_norm(ffn_residual)
+                write_tensor(prefix.with_name(prefix.name + ".npy"), current)
+
+            encoder_output = current
+            write_tensor(output_dir / "encoder_output.npy", encoder_output)
 
             # 3. Variance adaptor
             (

@@ -24,6 +24,10 @@ static bool dump_enabled() {
     return g_dump_ctx.enabled;
 }
 
+bool is_dump_enabled() {
+    return dump_enabled();
+}
+
 static void ensure_dump_dir() {
     if (!g_dump_ctx.enabled || g_dump_ctx.dir.empty()) return;
 #ifdef _WIN32
@@ -44,7 +48,7 @@ static std::string make_dump_path(const char* name) {
     return path;
 }
 
-static void dump_float_matrix(const char* name, const float* data, int rows, int cols) {
+void dump_float_matrix(const char* name, const float* data, int rows, int cols) {
     if (!dump_enabled()) return;
     std::string path = make_dump_path(name);
     FILE* f = fopen(path.c_str(), "wb");
@@ -58,11 +62,11 @@ static void dump_float_matrix(const char* name, const float* data, int rows, int
     fclose(f);
 }
 
-static void dump_float_vector(const char* name, const float* data, int length) {
+void dump_float_vector(const char* name, const float* data, int length) {
     dump_float_matrix(name, data, length, 1);
 }
 
-static void dump_int_vector(const char* name, const int* data, int length) {
+void dump_int_vector(const char* name, const int* data, int length) {
     if (!dump_enabled()) return;
     std::string path = make_dump_path(name);
     FILE* f = fopen(path.c_str(), "wb");
@@ -540,10 +544,35 @@ void load_weights(const char* weights_dir, Weights* w, Config* c) {
 // ============================================================================
 
 int quantize_value(float value, float min_val, float max_val, int n_bins) {
-    // Quantize a continuous value to bin index
-    float normalized = (value - min_val) / (max_val - min_val);
-    normalized = fmaxf(0.0f, fminf(1.0f, normalized));  // Clip to [0, 1]
-    int bin = (int)(normalized * (n_bins - 1));
+    // Mirror torch.bucketize() behavior used by the PyTorch implementation.
+    if (n_bins <= 1 || max_val <= min_val) {
+        return 0;
+    }
+
+    if (value <= min_val) {
+        return 0;
+    }
+    if (value > max_val) {
+        return n_bins - 1;
+    }
+
+    int bin_count = n_bins - 1;  // Number of bucket boundaries
+    if (bin_count == 1) {
+        return 1;
+    }
+
+    float step = (max_val - min_val) / (float)(bin_count - 1);
+    if (step <= 0.0f) {
+        return 0;
+    }
+
+    float ratio = (value - min_val) / step;
+    int bin = (int)ceilf(ratio);
+    if (bin < 0) {
+        bin = 0;
+    } else if (bin >= n_bins) {
+        bin = n_bins - 1;
+    }
     return bin;
 }
 
@@ -551,23 +580,54 @@ int quantize_value(float value, float min_val, float max_val, int n_bins) {
 // Encoder Implementation
 // ============================================================================
 
-void encoder_layer_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len) {
+void encoder_layer_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len, int layer_idx) {
+    bool should_dump = (layer_idx >= 0) && dump_enabled();
+    std::vector<float> residual_input(seq_len * c->dim);
+    memcpy(residual_input.data(), x, seq_len * c->dim * sizeof(float));
+
     // Multi-Head Self-Attention
     multi_head_attention(s, c, layer, x, x, x, seq_len, seq_len);
 
+    if (should_dump) {
+        std::string prefix = "encoder_layer_" + std::to_string(layer_idx) + "_";
+        dump_float_matrix((prefix + "attn_q.bin").c_str(), s->attn_q, seq_len, c->dim);
+        dump_float_matrix((prefix + "attn_k.bin").c_str(), s->attn_k, seq_len, c->dim);
+        dump_float_matrix((prefix + "attn_v.bin").c_str(), s->attn_v, seq_len, c->dim);
+        std::vector<float> attn_out_pre(seq_len * c->dim);
+        memcpy(attn_out_pre.data(), s->attn_out, seq_len * c->dim * sizeof(float));
+        dump_float_matrix((prefix + "attn_out.bin").c_str(), attn_out_pre.data(), seq_len, c->dim);
+    }
+
     // Residual connection + Layer Norm
     for (int i = 0; i < seq_len * c->dim; i++) {
-        s->attn_out[i] += x[i];
+        s->attn_out[i] += residual_input[i];
     }
+
+    if (should_dump) {
+        std::string prefix = "encoder_layer_" + std::to_string(layer_idx) + "_";
+        dump_float_matrix((prefix + "attn_residual.bin").c_str(), s->attn_out, seq_len, c->dim);
+    }
+
     layer_norm(s->attn_out, s->attn_out, layer->attn_norm_gamma, layer->attn_norm_beta, seq_len, c->dim);
 
+    if (should_dump) {
+        std::string prefix = "encoder_layer_" + std::to_string(layer_idx) + "_";
+        dump_float_matrix((prefix + "attn_norm.bin").c_str(), s->attn_out, seq_len, c->dim);
+    }
+
     // Feed-Forward Network
-    feed_forward(s, c, layer, s->attn_out, seq_len);
+    feed_forward(s, c, layer, s->attn_out, seq_len, layer_idx);
 
     // Residual connection + Layer Norm
     for (int i = 0; i < seq_len * c->dim; i++) {
         s->ffn_out[i] += s->attn_out[i];
     }
+
+    if (should_dump) {
+        std::string prefix = "encoder_layer_" + std::to_string(layer_idx) + "_";
+        dump_float_matrix((prefix + "ffn_residual.bin").c_str(), s->ffn_out, seq_len, c->dim);
+    }
+
     layer_norm(s->attn_out, s->ffn_out, layer->ffn_norm_gamma, layer->ffn_norm_beta, seq_len, c->dim);
 }
 
@@ -598,7 +658,7 @@ void encoder_forward(RunState* s, Config* c, Weights* w, int* phoneme_ids, int n
     // 3. Pass through encoder layers
     float* x = s->encoder_emb;
     for (int layer = 0; layer < c->n_enc_layers; layer++) {
-        encoder_layer_forward(s, c, &w->encoder_layers[layer], x, n_phonemes);
+        encoder_layer_forward(s, c, &w->encoder_layers[layer], x, n_phonemes, layer);
         if (dump_enabled()) {
             char filename[64];
             snprintf(filename, sizeof(filename), "encoder_layer_%d.bin", layer);
@@ -666,26 +726,32 @@ void variance_adaptor_forward(RunState* s, Config* c, Weights* w, int n_phonemes
     // 1. Predict duration, pitch, energy
     variance_predictor_forward(s, c, &w->duration_predictor, s->encoder_out, n_phonemes, s->duration_pred);
     variance_predictor_forward(s, c, &w->pitch_predictor, s->encoder_out, n_phonemes, s->pitch_pred);
+
+    // Apply pitch embedding immediately (phoneme-level)
+    for (int i = 0; i < n_phonemes; i++) {
+        int pitch_bin = quantize_value(s->pitch_pred[i], c->pitch_min, c->pitch_max, c->n_bins);
+        const float* emb = w->pitch_embedding + pitch_bin * c->dim;
+        for (int j = 0; j < c->dim; j++) {
+            s->encoder_out[i * c->dim + j] += emb[j];
+        }
+    }
+
     variance_predictor_forward(s, c, &w->energy_predictor, s->encoder_out, n_phonemes, s->energy_pred);
+
+    // Apply energy embedding immediately (phoneme-level)
+    for (int i = 0; i < n_phonemes; i++) {
+        int energy_bin = quantize_value(s->energy_pred[i], c->energy_min, c->energy_max, c->n_bins);
+        const float* emb = w->energy_embedding + energy_bin * c->dim;
+        for (int j = 0; j < c->dim; j++) {
+            s->encoder_out[i * c->dim + j] += emb[j];
+        }
+    }
 
     std::vector<float> log_duration_values;
     if (dump_enabled()) {
         dump_float_vector("pitch_prediction.bin", s->pitch_pred, n_phonemes);
         dump_float_vector("energy_prediction.bin", s->energy_pred, n_phonemes);
         log_duration_values.assign(s->duration_pred, s->duration_pred + n_phonemes);
-    }
-
-    // 2. Quantize and embed pitch/energy (phoneme-level)
-    for (int i = 0; i < n_phonemes; i++) {
-        // Quantize predictions to bin indices
-        int pitch_bin = quantize_value(s->pitch_pred[i], c->pitch_min, c->pitch_max, c->n_bins);
-        int energy_bin = quantize_value(s->energy_pred[i], c->energy_min, c->energy_max, c->n_bins);
-
-        // Add pitch and energy embeddings to encoder output
-        for (int j = 0; j < c->dim; j++) {
-            s->encoder_out[i * c->dim + j] += w->pitch_embedding[pitch_bin * c->dim + j];
-            s->encoder_out[i * c->dim + j] += w->energy_embedding[energy_bin * c->dim + j];
-        }
     }
 
     // 3. Length Regulation - expand phoneme sequence to mel frames
@@ -751,7 +817,7 @@ void variance_adaptor_forward(RunState* s, Config* c, Weights* w, int n_phonemes
 
 void decoder_layer_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len) {
     // Same structure as encoder layer
-    encoder_layer_forward(s, c, layer, x, seq_len);
+    encoder_layer_forward(s, c, layer, x, seq_len, -1);
 }
 
 void decoder_forward(RunState* s, Config* c, Weights* w, int mel_len) {
@@ -829,8 +895,9 @@ void postnet_forward(RunState* s, Config* c, Weights* w, int mel_len) {
     }
 
     // Last layer: [mel_len, postnet_embedding_dim] -> [mel_len, n_mels]
-    float* last_in = ((n_convs - 2) % 2 == 1) ? s->conv_buf2 : s->conv_buf1;
-    float* temp_out = s->conv_buf2;  // Use conv_buf2 as temporary
+    bool last_in_is_buf2 = ((n_convs - 2) % 2 == 1);
+    float* last_in = last_in_is_buf2 ? s->conv_buf2 : s->conv_buf1;
+    float* temp_out = last_in_is_buf2 ? s->conv_buf1 : s->conv_buf2;
 
     conv1d(temp_out, last_in, w->postnet_layers[n_convs - 1].conv_weight,
            w->postnet_layers[n_convs - 1].conv_bias,

@@ -375,14 +375,53 @@ def dump_postnet_layer(state_dict: OrderedDict, prefix: str, out_dir: Path, inde
         save_tensor(state_dict[key], layer_dir / filename)
 
 
-def convert_model(checkpoint_path: Path, preprocess_cfg, model_cfg, output_dir: Path):
+def resolve_stats(preprocess_cfg: dict, preprocess_cfg_path: Path) -> Dict[str, Any]:
+    raw_path = Path(preprocess_cfg["path"]["preprocessed_path"])
+    candidate_dirs = []
+
+    if raw_path.is_absolute():
+        candidate_dirs.append(raw_path)
+    else:
+        cfg_dir = preprocess_cfg_path.parent.resolve()
+        cwd = Path.cwd().resolve()
+        roots = [cfg_dir, cfg_dir.parent, cwd, cwd.parent]
+        seen = set()
+        for root in roots:
+            candidate = (root / raw_path).resolve()
+            if candidate not in seen:
+                candidate_dirs.append(candidate)
+                seen.add(candidate)
+        extra_candidates = [
+            (cwd / raw_path).resolve(),
+            raw_path.resolve(),
+        ]
+        for candidate in extra_candidates:
+            if candidate not in seen:
+                candidate_dirs.append(candidate)
+                seen.add(candidate)
+
+    for candidate in candidate_dirs:
+        stats_path = candidate / "stats.json"
+        if stats_path.is_file():
+            return json.loads(stats_path.read_text())
+
+    print(
+        f"Warning: Could not locate stats.json relative to {preprocess_cfg_path}. "
+        "Pitch and energy stats default to zeros."
+    )
+    return {"pitch": [0.0, 0.0], "energy": [0.0, 0.0]}
+
+
+def convert_model(
+    checkpoint_path: Path,
+    preprocess_cfg,
+    model_cfg,
+    output_dir: Path,
+    preprocess_cfg_path: Path,
+):
     state_dict = load_state_dict(checkpoint_path)
 
-    stats_path = Path(preprocess_cfg["path"]["preprocessed_path"]) / "stats.json"
-    if stats_path.is_file():
-        stats = json.loads(stats_path.read_text())
-    else:
-        stats = {"pitch": [0.0, 0.0], "energy": [0.0, 0.0]}
+    stats = resolve_stats(preprocess_cfg, preprocess_cfg_path)
 
     out_dir = Path(output_dir)
     encoder_dir = out_dir / "encoder"
@@ -458,7 +497,13 @@ def main():
     with open(args.model_config) as f:
         model_cfg = yaml.load(f, Loader=yaml.FullLoader)
 
-    convert_model(Path(args.checkpoint), preprocess_cfg, model_cfg, Path(args.output_dir))
+    convert_model(
+        Path(args.checkpoint),
+        preprocess_cfg,
+        model_cfg,
+        Path(args.output_dir),
+        Path(args.preprocess_config).resolve(),
+    )
 
 
 if __name__ == "__main__":

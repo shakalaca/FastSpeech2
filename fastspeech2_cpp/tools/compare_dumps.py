@@ -12,8 +12,6 @@ import numpy as np
 
 
 BASE_FLOAT_KEYS = [
-    "encoder_embedding",
-    "encoder_output",
     "variance_output",
     "pitch_prediction",
     "energy_prediction",
@@ -66,14 +64,34 @@ def compare_directory(pytorch_dir: Path, cpp_dir: Path, abs_tol: float, rel_tol:
     status = 0
 
     print("=== Comparing float tensors ===")
-    float_keys = list(BASE_FLOAT_KEYS)
-    # Collect per-layer encoder dumps if present
+    float_keys = ["encoder_embedding"]
     layer_idx = 0
+    layer_suffixes = [
+        "attn_q",
+        "attn_k",
+        "attn_v",
+        "attn_out",
+        "attn_residual",
+        "attn_norm",
+        "ffn_pre_relu",
+        "ffn_post_relu",
+        "ffn_out",
+        "ffn_residual",
+        "",
+    ]
+
     while (pytorch_dir / f"encoder_layer_{layer_idx}.npy").exists() and (
         cpp_dir / f"encoder_layer_{layer_idx}.bin"
     ).exists():
-        float_keys.insert(1 + layer_idx, f"encoder_layer_{layer_idx}")
+        for suffix in layer_suffixes:
+            name = f"encoder_layer_{layer_idx}"
+            if suffix:
+                name += f"_{suffix}"
+            float_keys.append(name)
         layer_idx += 1
+
+    float_keys.append("encoder_output")
+    float_keys.extend(BASE_FLOAT_KEYS)
 
     for key in float_keys:
         pt = load_pytorch_dump(pytorch_dir, key)

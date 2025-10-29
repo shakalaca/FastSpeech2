@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <string>
 
 // ============================================================================
 // Basic Linear Algebra Operations
@@ -243,7 +244,7 @@ void multi_head_attention(RunState* s, Config* c, FFTLayer* layer,
 // Feed-Forward Network
 // ============================================================================
 
-void feed_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len) {
+void feed_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len, int layer_idx) {
     // Two-layer position-wise feed-forward network implemented as conv1d ops.
     int dim = c->dim;
     int ffn_hidden = c->ffn_hidden;
@@ -254,9 +255,23 @@ void feed_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len
 
     conv1d(s->ffn_hidden, x, layer->ffn_w1, layer->ffn_b1,
            1, dim, ffn_hidden, seq_len, k1, pad1);
-    gelu(s->ffn_hidden, seq_len * ffn_hidden);
+    bool should_dump = is_dump_enabled() && layer_idx >= 0;
+
+    if (should_dump) {
+        std::string prefix = "encoder_layer_" + std::to_string(layer_idx) + "_";
+        dump_float_matrix((prefix + "ffn_pre_relu.bin").c_str(), s->ffn_hidden, seq_len, ffn_hidden);
+    }
+    relu(s->ffn_hidden, seq_len * ffn_hidden);
+    if (should_dump) {
+        std::string prefix = "encoder_layer_" + std::to_string(layer_idx) + "_";
+        dump_float_matrix((prefix + "ffn_post_relu.bin").c_str(), s->ffn_hidden, seq_len, ffn_hidden);
+    }
     conv1d(s->ffn_out, s->ffn_hidden, layer->ffn_w2, layer->ffn_b2,
            1, ffn_hidden, dim, seq_len, k2, pad2);
+    if (should_dump) {
+        std::string prefix = "encoder_layer_" + std::to_string(layer_idx) + "_";
+        dump_float_matrix((prefix + "ffn_out.bin").c_str(), s->ffn_out, seq_len, dim);
+    }
 }
 
 // ============================================================================

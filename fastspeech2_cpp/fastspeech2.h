@@ -169,7 +169,7 @@ void load_weights(const char* weights_path, Weights* w, Config* c);
 
 // Model components
 void encoder_forward(RunState* s, Config* c, Weights* w, int* phoneme_ids, int n_phonemes);
-void encoder_layer_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len);
+void encoder_layer_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len, int layer_idx);
 
 void variance_predictor_forward(RunState* s, Config* c, VariancePredictor* vp,
                                 float* x, int seq_len, float* output);
@@ -189,5 +189,9 @@ int quantize_value(float value, float min_val, float max_val, int n_bins);
 
 // Debug / dumping helpers
 void set_dump_directory(const char* path);
+bool is_dump_enabled();
+void dump_float_matrix(const char* name, const float* data, int rows, int cols);
+void dump_float_vector(const char* name, const float* data, int length);
+void dump_int_vector(const char* name, const int* data, int length);
 
 #endif // FASTSPEECH2_H

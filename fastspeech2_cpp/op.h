@@ -26,7 +26,7 @@ void multi_head_attention(RunState* s, Config* c, FFTLayer* layer,
                          int q_len, int kv_len);
 
 // Feed-forward network
-void feed_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len);
+void feed_forward(RunState* s, Config* c, FFTLayer* layer, float* x, int seq_len, int layer_idx);
 
 // Convolution operations
 void conv1d(float* out, float* in, float* weight, float* bias,
